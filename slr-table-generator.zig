@@ -99,135 +99,11 @@ const ProductionInstance = struct {
     }
 };
 
-/// Verify that a type has an eql method so that it can be used in Grammar
-/// generation.
-/// (Copied and slightly modified from the standard libary's
-/// hash_map.zig::verifyContext function)
-fn verifyGrammarSymbolType(comptime X: type) void {
-    var allow_const_ptr = false;
-    var allow_mutable_ptr = false;
-    // Make sure X is a namespace type which may have member functions
-    switch (@typeInfo(X)) {
-        .Struct, .Union, .Enum => {},
-        // Special-case .Opaque for a better error message
-        .Opaque => @compileError("Grammar symbol must be a type with an eql member function.  Cannot use " ++ @typeName(X) ++ " because it is opaque.  Use a pointer instead."),
-        .Pointer => |ptr| {
-            if (ptr.size != .One) {
-                @compileError("Grammar symbol must be a type with an eql member function.  Cannot use " ++ @typeName(X) ++ " because it is not a single pointer.");
-            }
-            X = ptr.child;
-            allow_const_ptr = true;
-            allow_mutable_ptr = !ptr.is_const;
-            switch (@typeInfo(X)) {
-                .Struct, .Union, .Enum, .Opaque => {},
-                else => @compileError("Grammar symbol must be a type with an eql member function.  Cannot use " ++ @typeName(X)),
-            }
-        },
-        else => @compileError("Grammar symbol must be a type with an eql member function.  Cannot use " ++ @typeName(X)),
-    }
-
-    // Keep track of multiple errors so we can report them all.
-    var errors: []const u8 = "";
-
-    // Put common errors here, they will only be evaluated
-    // if the error is actually triggered.
-    const lazy = struct {
-        const prefix = "\n  ";
-        const deep_prefix = prefix ++ "  ";
-        const eql_signature = "pub fn (" ++ @typeName(X) ++ ", " ++
-            @typeName(X) ++ ") bool";
-        const err_invalid_eql_signature = prefix ++ @typeName(X) ++ ".eql must be " ++ eql_signature ++
-            deep_prefix ++ "but is actually " ++ @typeName(@TypeOf(X.eql));
-    };
-
-    // Verify X.eql(self, X, X) => bool
-    if (@hasDecl(X, "eql")) {
-        const eql = X.eql;
-        const info = @typeInfo(@TypeOf(eql));
-        if (info == .Fn) {
-            const func = info.Fn;
-            const args_len = 2;
-            if (func.params.len != args_len) {
-                errors = errors ++ lazy.err_invalid_eql_signature;
-            } else {
-                var emitted_signature = false;
-                inline for (0..args_len) |i| {
-                    if (func.params[i].type) |Self| {
-                        if (Self == X) {
-                            // pass, this is always fine.
-                        } else if (Self == *const X) {
-                            if (!allow_const_ptr) {
-                                if (!emitted_signature) {
-                                    errors = errors ++ lazy.err_invalid_eql_signature;
-                                    emitted_signature = true;
-                                }
-                                errors = errors ++ lazy.deep_prefix ++ std.fmt.comptimePrint("Parameter {d} must be ", .{i}) ++ @typeName(X) ++ ", but is " ++ @typeName(Self);
-                                errors = errors ++ lazy.deep_prefix ++ "Note: Cannot be a pointer because it is passed by value.";
-                            }
-                        } else if (Self == *X) {
-                            if (!allow_mutable_ptr) {
-                                if (!emitted_signature) {
-                                    errors = errors ++ lazy.err_invalid_eql_signature;
-                                    emitted_signature = true;
-                                }
-                                if (!allow_const_ptr) {
-                                    errors = errors ++ lazy.deep_prefix ++ std.fmt.comptimePrint("Parameter {d} must be ", .{i}) ++ @typeName(X) ++ ", but is " ++ @typeName(Self);
-                                    errors = errors ++ lazy.deep_prefix ++ "Note: Cannot be a pointer because it is passed by value.";
-                                } else {
-                                    errors = errors ++ lazy.deep_prefix ++ std.fmt.comptimePrint("Parameter {d} must be ", .{i}) ++ @typeName(X) ++ " or " ++ @typeName(*const X) ++ ", but is " ++ @typeName(Self);
-                                    errors = errors ++ lazy.deep_prefix ++ "Note: Cannot be non-const because it is passed by const pointer.";
-                                }
-                            }
-                        } else {
-                            if (!emitted_signature) {
-                                errors = errors ++ lazy.err_invalid_eql_signature;
-                                emitted_signature = true;
-                            }
-                            errors = errors ++ lazy.deep_prefix ++ std.fmt.comptimePrint("Parameter {d} must be ", .{i}) ++ @typeName(X);
-                            if (allow_const_ptr) {
-                                errors = errors ++ " or " ++ @typeName(*const X);
-                                if (allow_mutable_ptr) {
-                                    errors = errors ++ " or " ++ @typeName(*X);
-                                }
-                            }
-                            errors = errors ++ ", but is " ++ @typeName(Self);
-                        }
-                    }
-                }
-
-                if (func.return_type.? != bool) {
-                    if (!emitted_signature) {
-                        errors = errors ++ lazy.err_invalid_eql_signature;
-                        emitted_signature = true;
-                    }
-                    errors = errors ++ lazy.deep_prefix ++ "Return type must be bool, but was " ++ @typeName(func.return_type.?);
-                }
-                // If any of these are generic (null), we cannot verify them.
-                // The call sites check the return type, but cannot check the
-                // parameters.  This may cause compile errors with generic hash/eql functions.
-            }
-        } else {
-            errors = errors ++ lazy.err_invalid_eql_signature;
-        }
-    } else {
-        errors = errors ++ lazy.prefix ++ @typeName(X) ++ " must declare an eql function with signature " ++ lazy.eql_signature ++ "\n(Note: The function must be public if in a different file)";
-    }
-
-    if (errors.len != 0) {
-        // errors begins with a newline (from lazy.prefix)
-        @compileError("Problems found with grammar symbol type " ++ @typeName(X) ++ ":" ++ errors);
-    }
-}
-
 // NOTE: variables ids MUST START AT 0 and MUST BE SMALLER THAN ALL TERMINAL IDS and MUST BE ORDERED
 // NOTE: comparison of symbols is not always done using .eql in below functions, should try to make this consistent
 // NOTE: FOLLOW and FIRST sets generation code is way too nested, should ideally
 //       be broken down into smaller functions
 pub fn Grammar(comptime Variable: type, comptime Terminal: type) type {
-    // Verify both V and T have correct .eql methods
-    verifyGrammarSymbolType(Variable);
-    verifyGrammarSymbolType(Terminal);
-
     return struct {
         const Self = @This();
 
@@ -314,12 +190,13 @@ pub fn Grammar(comptime Variable: type, comptime Terminal: type) type {
         /// Verify the structure and types of the given tuples. Return void
         /// since this will be done at comptime and all errors will be compiler
         /// errors.
+        /// TODO: Consider removing 
         fn verifyTuples(comptime rule_tuples: anytype) void {
             const RuleTuplesType = @TypeOf(rule_tuples);
             const rule_tuples_type_info = @typeInfo(RuleTuplesType);
 
             // Verify rule_tuples is a tuple (struct with no named fields)
-            if (rule_tuples_type_info != .Struct or !rule_tuples_type_info.Struct.is_tuple) {
+            if (rule_tuples_type_info != .@"struct" or !rule_tuples_type_info.@"struct".is_tuple) {
                 @compileError("Expected tuple of rules. Cannot use '" ++ @typeName(RuleTuplesType) ++ "'");
             }
             // Verify rule_tuples is not empty
@@ -334,7 +211,7 @@ pub fn Grammar(comptime Variable: type, comptime Terminal: type) type {
                 const rule_type_info = @typeInfo(RuleType);
 
                 // Each rule should be a tuple
-                if (rule_type_info != .Struct or !rule_type_info.Struct.is_tuple) {
+                if (rule_type_info != .@"struct" or !rule_type_info.@"struct".is_tuple) {
                     @compileError(std.fmt.comptimePrint("Each rule must be a tuple, found '" ++ @typeName(rule) ++ "' (rule {d})", .{i}));
                 }
                 // Each rule should have exactly 2 fields
@@ -355,7 +232,7 @@ pub fn Grammar(comptime Variable: type, comptime Terminal: type) type {
                 const rhs_type_info = @typeInfo(RhsType);
 
                 // Verify rhs is a tuple (struct with no named fields)
-                if (rhs_type_info != .Struct or !rhs_type_info.Struct.is_tuple) {
+                if (rhs_type_info != .@"struct" or !rhs_type_info.@"struct".is_tuple) {
                     @compileError(std.fmt.comptimePrint("The second field in each rule tuple must be a tuple, found '" ++ @typeName(RuleTuplesType) ++ "' (rule {d})", .{i}));
                 }
                 // Verify rhs is not empty
@@ -465,7 +342,7 @@ pub fn Grammar(comptime Variable: type, comptime Terminal: type) type {
                 defer stack.deinit();
                 stack.appendAssumeCapacity(Symbol{ .variable = @intCast(v_idx) });
 
-                while (stack.popOrNull()) |top_symbol| {
+                while (stack.pop()) |top_symbol| {
                     for (self.rules) |rule| {
                         if (!rule.lhs.eql(top_symbol)) {
                             continue;
@@ -552,7 +429,7 @@ pub fn Grammar(comptime Variable: type, comptime Terminal: type) type {
         // NOTE: Assumes $ is last terminal symbol ID and S' is the first symbol ID
         //       (0). FOLLOW(S') will be initialized to {$}, which will then be
         //       propogated as needed
-        pub fn getFollowSet(self: Self, allocator: std.mem.Allocator) ![][]const bool {
+        pub fn getFollowSet(self: Self, allocator: std.mem.Allocator) ![][] bool {
             const first_set = try self.getFirstSet(allocator);
             defer {
                 for (first_set) |row| allocator.free(row);
@@ -587,7 +464,7 @@ pub fn Grammar(comptime Variable: type, comptime Terminal: type) type {
                 defer stack.deinit();
                 stack.appendAssumeCapacity(Symbol{ .variable = @intCast(v_idx) });
 
-                while (stack.popOrNull()) |top_symbol| {
+                while (stack.pop()) |top_symbol| {
                     for (self.rules) |rule| {
                         for (rule.rhs[0 .. rule.rhs.len - 1], 0..) |rhs_symbol, i| {
                             if (!rhs_symbol.eql(top_symbol)) {
@@ -991,6 +868,7 @@ test "firsts_and_follows [grammar2.2]" {
     // R9:  wff4 -> ~ wff4
     // R10: prop -> (wff1)
     // R11: prop -> PROPTOK
+    @setEvalBranchQuota(10000);
 
     const V = TestVariable.fromString;
     const G = Grammar(TestVariable, TestTerminal);
@@ -1229,7 +1107,7 @@ pub fn ParseTable(comptime Variable: type, comptime Terminal: type) type {
 
             // Expand all given ProductionInstances and track all of the symbols
             // currently being read.
-            while (stack.popOrNull()) |prod| {
+            while (stack.pop()) |prod| {
                 if (prod.readCursor()) |sym| {
                     switch (sym) {
                         .variable => |idx| {
