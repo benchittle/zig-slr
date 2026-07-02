@@ -575,6 +575,24 @@ const TestTerminal = enum {
     }
 };
 
+const CustomTestTerminal = struct {
+    const Self = @This();
+
+    name: []const u8,
+
+    fn fromString(string: []const u8) Self {
+        return Self{ .name = string };
+    }
+
+    fn getString(self: Self) []const u8 {
+        return self.name;
+    }
+
+    fn eql(self: Self, other: Self) bool {
+        return std.mem.eql(u8, self.name, other.name);
+    }
+};
+
 const TestVariable = struct {
     const Self = @This();
 
@@ -876,6 +894,124 @@ test "firsts_and_follows [grammar2.2]" {
     //     }
     //     debug.print("\n", .{});
     // }
+}
+
+fn tableFromTuples(
+    comptime tuples: anytype,
+    comptime Variable: type,
+    comptime Terminal: type,
+    grammar: Grammar(Variable, Terminal),
+) [grammar.getVariableCount() * grammar.getTerminalCount()]bool {
+    comptime {
+        var first_set = [_]bool {false} ** (grammar.getVariableCount() * grammar.getTerminalCount());
+        var first_set_2d_view = utils.Slice2d([]bool).init(&first_set, grammar.getTerminalCount());
+
+        for (tuples) |tuple| {
+            const variable = tuple.@"0";
+            const v_idx = grammar.getSymbolFromVariable(variable).?.variable;
+
+            const terminals = tuple.@"1";
+            for (std.meta.fieldNames(@TypeOf(terminals))) |rhs_tuple_field_name| {
+                const terminal = @field(terminals, rhs_tuple_field_name);
+                if (@TypeOf(terminal) != Terminal) {
+                    @compileError("rhs of tuple must only contain Terminals");
+                }
+
+                const t_idx = grammar.getSymbolFromTerminal(terminal).?.terminal;
+
+                first_set_2d_view.row(v_idx)[t_idx] = true;
+            }
+        }
+        return first_set;
+    }
+}
+
+test "first_and_follows [custom1]" {
+    const V = TestVariable.fromString;
+    const T = CustomTestTerminal.fromString;
+    const G = Grammar(TestVariable, CustomTestTerminal);
+
+    const grammar = comptime G.initFromTuples(
+        .{
+            .{ V("B"), .{ T("#") } },
+            .{ V("B"), .{ T("("), V("A"), T(")") } },
+            .{ V("A"), .{ V("B") } },
+            .{ V("A"), .{ T("~"), V("A") } },
+            .{ V("S"), .{ V("A") } },
+        },
+        V("S"),
+        T("$"),
+    );
+    defer grammar.deinit();
+
+    var allocator = std.testing.allocator;
+
+    const first_set = try grammar.getFirstSet(allocator);
+    defer allocator.free(first_set);
+
+    const first_set_comptime = comptime grammar.getFirstSetComptime();
+
+    const expected_first_set = comptime tableFromTuples(
+        .{
+            .{ V("S"), .{ T("("), T("#"), T("~") } },
+            .{ V("A"), .{ T("("), T("#"), T("~") } },
+            .{ V("B"), .{ T("("), T("#") } },
+        },
+        TestVariable,
+        CustomTestTerminal,
+        grammar
+    );
+
+    try std.testing.expectEqualSlices(bool, &expected_first_set, first_set);
+    try std.testing.expectEqualSlices(bool, &expected_first_set, &first_set_comptime);
+}
+
+test "first_and_follows [custom2]" {
+    const V = TestVariable.fromString;
+    const T = CustomTestTerminal.fromString;
+    const G = Grammar(TestVariable, CustomTestTerminal);
+
+    const grammar = comptime G.initFromTuples(
+        .{
+            .{ V("S"), .{ V("A") } },
+
+            .{ V("A"), .{ T("c"), V("B") } },
+            .{ V("A"), .{ T("a") } },
+
+            .{ V("B"), .{ V("C"), T("b") } },
+
+            .{ V("C"), .{ V("D") } },
+            .{ V("C"), .{ V("A"), T("d") } },
+
+            .{ V("D"), .{ T("q") } },
+        },
+        V("S"),
+        T("$"),
+    );
+    defer grammar.deinit();
+
+    var allocator = std.testing.allocator;
+
+    const first_set = try grammar.getFirstSet(allocator);
+    defer allocator.free(first_set);
+
+    const first_set_comptime = comptime grammar.getFirstSetComptime();
+
+    const expected_first_set = comptime tableFromTuples(
+        .{
+            .{ V("S"), .{ T("c"), T("a") } },
+            .{ V("A"), .{ T("c"), T("a") } },
+            .{ V("B"), .{ T("c"), T("a"), T("q") } },
+            .{ V("C"), .{ T("c"), T("a"), T("q") } },
+            .{ V("D"), .{ T("q") } },
+        },
+        TestVariable,
+        CustomTestTerminal,
+        grammar
+    );
+
+    try std.testing.expectEqualSlices(bool, &expected_first_set, first_set);
+    try std.testing.expectEqualSlices(bool, &expected_first_set, &first_set_comptime);
 }
 
 pub fn ParseTable(comptime Variable: type, comptime Terminal: type) type {
