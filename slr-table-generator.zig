@@ -137,14 +137,14 @@ pub fn Grammar(comptime Variable: type, comptime Terminal: type) type {
                     };
 
                     // Unpack the left hand side of the rule. We have already
-                    // checked that it is of type V.
+                    // checked that it is of type Variable.
                     const lhs = rule_tuple.@"0";
                     if (grammar.getSymbolFromVariable(lhs)) |id| {
                         rule.lhs = id;
                     } else {
                         // If we haven't seen this variable yet, append it to
                         // the variables list.
-                        rule.lhs = grammar.getVariableCount();
+                        rule.lhs = Symbol{ .variable = grammar.getVariableCount() };
                         grammar.variables = grammar.variables ++ &[_]Variable{lhs};
                     }
 
