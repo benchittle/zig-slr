@@ -310,58 +310,186 @@ pub fn Grammar(comptime Variable: type, comptime Terminal: type) type {
         }
 
         /// Caller must provide buffers with the necessary room:
-        /// * `first_set: [self.getVariableCount() * self.getTerminalCount()]bool`
-        /// * `seen: [self.getVariableCount()]bool`
-        /// * `stack_buffer: [self.getVariableCount()]Symbol`
+        /// * `first_set_table.slice: [self.getVariableCount() * self.getTerminalCount()]`
+        /// * `first_var_edge_list: [self.rules.len]`
+        /// * `first_var_edge_list_offsets: [self.getVariableCount() + 1]`
+        /// * `populated: [self.getVariableCount()]`
+        /// * `path: [self.getVariableCount()]`
+        /// * `path_edges_explored: [self.getVariableCount()]`
+        /// * `visited: [self.getVariableCount()]`
         ///
-        /// `first_set` is populated with the resulting table, the other buffers
-        /// can be freed immediately if they were dynamically allocated.
+        /// `first_set_table` is populated with the resulting table, the other
+        /// buffers can be freed immediately if they were dynamically allocated.
         fn computeFirstSet(
             self: Self,
-            first_set: []bool,
-            seen: []bool,
-            stack_buffer: []Symbol,
+            first_set_table: utils.Slice2d([]bool),
+            first_var_edge_list: []utils.GraphEdge(SymbolId.VariableId),
+            first_var_edge_list_offsets: []usize,
+            populated: []bool,
+            path: []SymbolId.VariableId,
+            path_edges_explored: []usize,
+            visited: []bool,
         ) void {
-            std.debug.assert(first_set.len >= self.getVariableCount() * self.getTerminalCount());
-            std.debug.assert(seen.len >= self.getVariableCount());
-            std.debug.assert(stack_buffer.len >= self.getVariableCount());
+            const GraphEdgeType = utils.GraphEdge(SymbolId.VariableId);
 
-            @memset(first_set, false);
-            var first_set_2d_view = utils.Slice2d([]bool).init(first_set, self.getTerminalCount());
+            std.debug.assert(first_set_table.slice.len == self.getVariableCount() * self.getTerminalCount());
+            std.debug.assert(first_var_edge_list.len == self.rules.len);
+            std.debug.assert(first_var_edge_list_offsets.len == self.getVariableCount() + 1);
+            std.debug.assert(populated.len == self.getVariableCount());
+            std.debug.assert(path.len == self.getVariableCount());
+            std.debug.assert(path_edges_explored.len == self.getVariableCount());
+            std.debug.assert(visited.len == self.getVariableCount());
 
-            for (0..self.getVariableCount()) |v_idx| {
-                @memset(seen, false);
-                seen[v_idx] = true;
+            @memset(first_set_table.slice, false);
+            @memset(first_var_edge_list, .{ .from = 0, .to = 0 });
+            @memset(first_var_edge_list_offsets, 0);
+            @memset(populated, false);
 
-                var stack = std.ArrayListUnmanaged(Symbol).initBuffer(stack_buffer);
-                stack.appendAssumeCapacity(Symbol{ .variable = @intCast(v_idx) });
+            // First we want to create a directional graph. Each node represents
+            // a variable, and an edge from nodes A to B exists if there is a
+            // grammar rule where A produces B as the first symbol.
+            // NOTE: From here on, grammar variables will be referred to as
+            //       nodes in comments and variable names.
+            // The graph is represented using a compressed sparse row format. In
+            // other words:
+            // - first_var_edge_list: Array of edges between nodes, sorted by
+            //   origin node.
+            // - first_var_edge_list_offsets: Index offset for the start of each
+            //   group of nodes in first_var_edge_list.
+            // So if first_var_edge_list_offsets[2] = 5, then the edges for the
+            // node with ID 2 can be found starting at index 5 of
+            // first_var_edge_list.
 
-                while (stack.pop()) |top_symbol| {
-                    for (self.rules) |rule| {
-                        if (!rule.lhs.eql(top_symbol)) {
-                            continue;
-                        }
-                        const first_rule_symbol = rule.rhs[0];
-                        switch (first_rule_symbol) {
-                            .terminal => |idx| first_set_2d_view.row(v_idx)[idx] = true,
-                            .variable => |idx| {
-                                if (seen[idx]) {
-                                    continue;
-                                }
-                                if (idx < v_idx) {
-                                    for (first_set_2d_view.row(idx), 0..) |is_in_first_list, i| {
-                                        if (is_in_first_list) {
-                                            first_set_2d_view.row(v_idx)[i] = true;
-                                        }
-                                    }
-                                } else {
-                                    stack.appendAssumeCapacity(first_rule_symbol);
-                                }
-                                seen[idx] = true;
-                            }
-                        }
+            // Populate first_set_table with terminals that appear as the first
+            // symbol on the right side of a production. Populate
+            // first_var_edge_list as described above.
+            var first_var_edge_count: usize = 0;
+            for (self.rules) |rule| {
+                const var_id = rule.lhs.variable_id;
+                const first_rule_symbol_id = rule.rhs[0];
+                switch (first_rule_symbol_id) {
+                    .terminal_id => |terminal_id| first_set_table.row(var_id)[terminal_id] = true,
+                    .variable_id => |other_var_id| {
+                        first_var_edge_list[first_var_edge_count].from = var_id;
+                        first_var_edge_list[first_var_edge_count].to = other_var_id;
+                        first_var_edge_count += 1;
+                    },
+                }
+            }
+
+            std.mem.sortUnstable(GraphEdgeType, first_var_edge_list[0..first_var_edge_count], {}, GraphEdgeType.lessThan);
+
+            // Populate first_var_edge_list_offsets as described above now that
+            // first_var_edge_list is sorted.
+            {
+                var current_key = first_var_edge_list[0].from;
+                var offset: usize = 0;
+                for (first_var_edge_list[0..first_var_edge_count], 0..) |entry, i| {
+                    if (current_key != entry.from) {
+                        offset = i;
+                        current_key = entry.from;
+                    }
+                    first_var_edge_list_offsets[entry.from] = offset;
+                }
+            }
+
+            // first_var_edge_list_offsets will be used to calculate the number
+            // of edges from a given node like:
+            // edges = offsets[i + 1] - offsets[i]
+            // To avoid an edge case (heh) with the last node,
+            // first_var_edge_list_offsets must be one longer than the number of
+            // nodes, and the last entry must be the number of edges in the
+            // graph.
+            first_var_edge_list_offsets[first_var_edge_list_offsets.len - 1] = first_var_edge_count;
+
+            // For the same reason, it is also helpful to propagate offsets
+            // backwards for any nodes that don't have any edges.
+            // So if node i has no edges originating from it, its offset will be
+            // the same as node (i + 1), rather than 0.
+            {
+                var last_offset = first_var_edge_count;
+                for (1..first_var_edge_list_offsets.len) |i| {
+                    const node_id = first_var_edge_list_offsets.len - i - 1;
+                    const offset = first_var_edge_list_offsets[node_id];
+                    if (first_var_edge_list[offset].from != node_id) {
+                        first_var_edge_list_offsets[node_id] = last_offset;
+                    } else {
+                        last_offset = offset;
                     }
                 }
+            }
+
+            // Now to solve the actual problem at hand: computing the FIRST set.
+            // - Starting from each node, we traverse the graph (depth first)
+            //   copying the terminal symbols from each node (variable) that is
+            //   reachable, and then mark the starting node as populated.
+            // - If we come across a node that is already populated, we don't
+            //   explore that path any farther, and instead just copy its
+            //   terminals.
+            // - We avoid visiting the same node twice in a path (to avoid
+            //   infinite loops).
+            // After all of the traversals are done, first_set_table will be
+            // fully populated.
+            for (0..self.getVariableCount()) |start_node| {
+                // Initialize path with the starting node.
+                var path_len: SymbolId.VariableId = 1;
+                path[0] = @intCast(start_node);
+
+                // Used to track how many edges we have already explored from
+                // each node along the path.
+                @memset(path_edges_explored, 0);
+
+                // Used to track which nodes have already been visited.
+                @memset(visited, false);
+                visited[start_node] = true;
+
+                // Perform a depth first traversal from the start node.
+                var state: enum { backtracking, exploring } = .exploring;
+                while (path_len > 0) switch (state) {
+                    .exploring => {
+                        const current_node = path[path_len - 1];
+                        const edges_explored = path_edges_explored[current_node];
+                        const edge_count = first_var_edge_list_offsets[@as(usize, current_node) + 1] - first_var_edge_list_offsets[current_node];
+
+                        if (edges_explored < edge_count) {
+                            // Get the node from the next unexplored edge.
+                            const next_node = first_var_edge_list[first_var_edge_list_offsets[current_node] + edges_explored].to;
+                            path_edges_explored[current_node] += 1;
+
+                            // Avoid loops.
+                            if (visited[next_node]) {
+                                continue;
+                            }
+
+                            // Continue exploring.
+                            visited[next_node] = true;
+                            path[path_len] = next_node;
+                            path_len += 1;
+
+                            // Unless we've already explored this path.
+                            if (populated[next_node]) {
+                                state = .backtracking;
+                            }
+                        } else {
+                            // We have explored this path fully, time to
+                            // backtrack
+                            state = .backtracking;
+                        }
+                    },
+                    .backtracking => {
+                        // Before we backtrack, copy terminals from the current
+                        // node into the starting node.
+                        const current_node = path[path_len - 1];
+                        utils.rowUnion(first_set_table, start_node, current_node);
+
+                        // Then move back one node and keep exploring.
+                        path_len -= 1;
+                        state = .exploring;
+                    },
+                };
+
+                // The FIRST set for this node is now fully populated.
+                populated[start_node] = true;
             }
         }
 
@@ -377,12 +505,28 @@ pub fn Grammar(comptime Variable: type, comptime Terminal: type) type {
         pub fn getFirstSet(self: Self, allocator: std.mem.Allocator) ![]bool {
             const first_set_buffer = try allocator.alloc(bool, self.getVariableCount() * self.getTerminalCount());
             errdefer allocator.free(first_set_buffer);
-            const seen_buffer = try allocator.alloc(bool, self.getVariableCount());
-            defer allocator.free(seen_buffer);
-            const stack_buffer = try allocator.alloc(Symbol, self.getVariableCount());
-            defer allocator.free(stack_buffer);
+            const first_var_edge_list_buffer = try allocator.alloc(utils.GraphEdge(SymbolId.VariableId), self.rules.len);
+            defer allocator.free(first_var_edge_list_buffer);
+            const first_var_edge_list_offsets_buffer = try allocator.alloc(usize, self.getVariableCount() + 1);
+            defer allocator.free(first_var_edge_list_offsets_buffer);
+            const populated_buffer = try allocator.alloc(bool, self.getVariableCount());
+            defer allocator.free(populated_buffer);
+            const path_buffer = try allocator.alloc(SymbolId.VariableId, self.getVariableCount());
+            defer allocator.free(path_buffer);
+            const path_edges_explored_buffer = try allocator.alloc(usize, self.getVariableCount());
+            defer allocator.free(path_edges_explored_buffer);
+            const visited_buffer = try allocator.alloc(bool, self.getVariableCount());
+            defer allocator.free(visited_buffer);
 
-            self.computeFirstSet(first_set_buffer, seen_buffer, stack_buffer);
+            self.computeFirstSet(
+                utils.Slice2d([]bool).init(first_set_buffer, self.getTerminalCount()),
+                first_var_edge_list_buffer,
+                first_var_edge_list_offsets_buffer,
+                populated_buffer,
+                path_buffer,
+                path_edges_explored_buffer,
+                visited_buffer,
+            );
             return first_set_buffer;
         }
 
@@ -390,10 +534,22 @@ pub fn Grammar(comptime Variable: type, comptime Terminal: type) type {
         pub fn getFirstSetComptime(comptime self: Self) [self.getVariableCount() * self.getTerminalCount()]bool {
             comptime {
                 var first_set_buffer: [self.getVariableCount() * self.getTerminalCount()]bool = undefined;
-                var seen_buffer: [self.getVariableCount()]bool = undefined;
-                var stack_buffer: [self.getVariableCount()]Symbol = undefined;
+                var first_var_edge_list_buffer: [self.rules.len]utils.GraphEdge(SymbolId.VariableId) = undefined;
+                var first_var_edge_list_offsets_buffer: [self.getVariableCount() + 1]usize = undefined;
+                var populated_buffer: [self.getVariableCount()]bool = undefined;
+                var path_buffer: [self.getVariableCount()]SymbolId.VariableId = undefined;
+                var path_edges_explored_buffer: [self.getVariableCount()]usize = undefined;
+                var visited_buffer: [self.getVariableCount()]bool = undefined;
 
-                self.computeFirstSet(&first_set_buffer, &seen_buffer, &stack_buffer);
+                self.computeFirstSet(
+                    utils.Slice2d([]bool).init(&first_set_buffer, self.getTerminalCount()),
+                    &first_var_edge_list_buffer,
+                    &first_var_edge_list_offsets_buffer,
+                    &populated_buffer,
+                    &path_buffer,
+                    &path_edges_explored_buffer,
+                    &visited_buffer,
+                );
                 return first_set_buffer;
             }
         }
@@ -489,17 +645,35 @@ pub fn Grammar(comptime Variable: type, comptime Terminal: type) type {
         pub fn getFollowSet(self: Self, allocator: std.mem.Allocator) ![]bool {
             const first_set_buffer = try allocator.alloc(bool, self.getVariableCount() * self.getTerminalCount());
             defer allocator.free(first_set_buffer);
-            const seen_buffer = try allocator.alloc(bool, self.getVariableCount());
-            defer allocator.free(seen_buffer);
-            const stack_buffer = try allocator.alloc(Symbol, self.getVariableCount());
-            defer allocator.free(stack_buffer);
+            const first_var_edge_list_buffer = try allocator.alloc(utils.GraphEdge(SymbolId.VariableId), self.rules.len);
+            defer allocator.free(first_var_edge_list_buffer);
+            const first_var_edge_list_offsets_buffer = try allocator.alloc(usize, self.getVariableCount() + 1);
+            defer allocator.free(first_var_edge_list_offsets_buffer);
+            const populated_buffer = try allocator.alloc(bool, self.getVariableCount());
+            defer allocator.free(populated_buffer);
+            const path_buffer = try allocator.alloc(SymbolId.VariableId, self.getVariableCount());
+            defer allocator.free(path_buffer);
+            const path_edges_explored_buffer = try allocator.alloc(usize, self.getVariableCount());
+            defer allocator.free(path_edges_explored_buffer);
+            const visited_buffer = try allocator.alloc(bool, self.getVariableCount());
+            defer allocator.free(visited_buffer);
 
-            self.computeFirstSet(first_set_buffer, seen_buffer, stack_buffer);
+            self.computeFirstSet(
+                utils.Slice2d([]bool).init(first_set_buffer, self.getTerminalCount()),
+                first_var_edge_list_buffer,
+                first_var_edge_list_offsets_buffer,
+                populated_buffer,
+                path_buffer,
+                path_edges_explored_buffer,
+                visited_buffer,
+            );
 
             const follow_set_buffer = try allocator.alloc(bool, self.getVariableCount() * self.getTerminalCount());
             errdefer allocator.free(follow_set_buffer);
+            const stack_buffer = try allocator.alloc(SymbolId, self.getVariableCount());
+            defer allocator.free(stack_buffer);
 
-            self.computeFollowSet(follow_set_buffer, seen_buffer, stack_buffer, first_set_buffer);
+            self.computeFollowSet(follow_set_buffer, visited_buffer, stack_buffer, first_set_buffer);
             return follow_set_buffer;
         }
 
@@ -507,14 +681,27 @@ pub fn Grammar(comptime Variable: type, comptime Terminal: type) type {
         pub fn getFollowSetComptime(comptime self: Self) [self.getVariableCount() * self.getTerminalCount()]bool {
             comptime {
                 var first_set_buffer: [self.getVariableCount() * self.getTerminalCount()]bool = undefined;
-                var seen_buffer: [self.getVariableCount()]bool = undefined;
-                var stack_buffer: [self.getVariableCount()]Symbol = undefined;
+                var first_var_edge_list_buffer: [self.rules.len]utils.GraphEdge(SymbolId.VariableId) = undefined;
+                var first_var_edge_list_offsets_buffer: [self.getVariableCount() + 1]usize = undefined;
+                var populated_buffer: [self.getVariableCount()]bool = undefined;
+                var path_buffer: [self.getVariableCount()]SymbolId.VariableId = undefined;
+                var path_edges_explored_buffer: [self.getVariableCount()]usize = undefined;
+                var visited_buffer: [self.getVariableCount()]bool = undefined;
 
-                self.computeFirstSet(&first_set_buffer, &seen_buffer, &stack_buffer);
+                self.computeFirstSet(
+                    utils.Slice2d([]bool).init(&first_set_buffer, self.getTerminalCount()),
+                    &first_var_edge_list_buffer,
+                    &first_var_edge_list_offsets_buffer,
+                    &populated_buffer,
+                    &path_buffer,
+                    &path_edges_explored_buffer,
+                    &visited_buffer,
+                );
 
                 var follow_set_buffer: [self.getVariableCount() * self.getTerminalCount()]bool = undefined;
+                var stack_buffer: [self.getVariableCount()]SymbolId = undefined;
 
-                self.computeFollowSet(&follow_set_buffer, &seen_buffer, &stack_buffer, &first_set_buffer);
+                self.computeFollowSet(&follow_set_buffer, &visited_buffer, &stack_buffer, &first_set_buffer);
                 return follow_set_buffer;
             }
         }
@@ -923,6 +1110,7 @@ fn tableFromTuples(
 }
 
 test "first_and_follows [custom1]" {
+    @setEvalBranchQuota(10000);
     const V = TestVariable.fromString;
     const T = CustomTestTerminal.fromString;
     const G = Grammar(TestVariable, CustomTestTerminal);
@@ -963,6 +1151,7 @@ test "first_and_follows [custom1]" {
 }
 
 test "first_and_follows [custom2]" {
+    @setEvalBranchQuota(10000);
     const V = TestVariable.fromString;
     const T = CustomTestTerminal.fromString;
     const G = Grammar(TestVariable, CustomTestTerminal);
