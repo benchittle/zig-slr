@@ -864,7 +864,6 @@ test "firsts_and_follows [grammar2.2]" {
     try std.testing.expectEqualSlices(bool, &expected_firsts, first_set);
     try std.testing.expectEqualSlices(bool, &expected_firsts, &first_set_comptime);
 
-
     const follow_set = try grammar.getFollowSet(allocator);
     defer allocator.free(follow_set);
 
@@ -1127,12 +1126,12 @@ pub fn ParseTable(comptime Variable: type, comptime Terminal: type) type {
             var variable_branches = try allocator.alloc(std.ArrayList(ProductionInstance), grammar.getVariableCount());
             errdefer allocator.free(variable_branches);
 
-            for (variable_branches, 0..) |_, i| {
-                variable_branches[i] = std.ArrayList(ProductionInstance).init(allocator);
+            for (0..variable_branches.len) |i| {
+                variable_branches[i] = std.ArrayList(ProductionInstance).empty;
             }
             errdefer {
-                for (variable_branches) |list| {
-                    list.deinit();
+                for (0..variable_branches.len) |i| {
+                    variable_branches[i].deinit(allocator);
                 }
                 allocator.free(variable_branches);
             }
@@ -1140,20 +1139,20 @@ pub fn ParseTable(comptime Variable: type, comptime Terminal: type) type {
             var terminal_branches = try allocator.alloc(std.ArrayList(ProductionInstance), grammar.getTerminalCount());
             errdefer allocator.free(terminal_branches);
 
-            for (terminal_branches, 0..) |_, i| {
-                terminal_branches[i] = std.ArrayList(ProductionInstance).init(allocator);
+            for (0..terminal_branches.len) |i| {
+                terminal_branches[i] = std.ArrayList(ProductionInstance).empty;
             }
             errdefer {
-                for (terminal_branches) |list| {
-                    list.deinit();
+                for (0..terminal_branches.len) |i| {
+                    terminal_branches[i].deinit(allocator);
                 }
                 allocator.free(terminal_branches);
             }
 
-            var stack = std.ArrayList(ProductionInstance).init(allocator);
-            defer stack.deinit();
+            var stack = std.ArrayList(ProductionInstance).empty;
+            defer stack.deinit(allocator);
 
-            try stack.appendSlice(productions);
+            try stack.appendSlice(allocator, productions);
 
             // Expand all given ProductionInstances and track all of the symbols
             // currently being read.
@@ -1167,14 +1166,14 @@ pub fn ParseTable(comptime Variable: type, comptime Terminal: type) type {
                             if (variable_branches[id].items.len == 0) {
                                 for (grammar.rules) |rule| {
                                     if (sym.eql(rule.lhs)) {
-                                        try stack.append(ProductionInstance.fromProduction(rule));
+                                        try stack.append(allocator, ProductionInstance.fromProduction(rule));
                                     }
                                 }
                             }
                             // Add the variable as a branch.
-                            try variable_branches[id].append(prod.copyAdvanceCursor());
+                            try variable_branches[id].append(allocator, prod.copyAdvanceCursor());
                         },
-                        .terminal_id => |id| try terminal_branches[id].append(prod.copyAdvanceCursor()),
+                        .terminal_id => |id| try terminal_branches[id].append(allocator, prod.copyAdvanceCursor()),
                     }
                 }
             }
@@ -1246,38 +1245,38 @@ pub fn ParseTable(comptime Variable: type, comptime Terminal: type) type {
         }
 
         fn generateTables(allocator: std.mem.Allocator, grammar: GrammarType) !struct { [][]Action, [][]Action } {
-            var goto_table = std.ArrayList([]Action).init(allocator);
-            defer goto_table.deinit();
+            var goto_table = std.ArrayList([]Action).empty;
+            defer goto_table.deinit(allocator);
             errdefer for (goto_table.items) |row| {
                 allocator.free(row);
             };
-            var action_table = std.ArrayList([]Action).init(allocator);
-            defer action_table.deinit();
+            var action_table = std.ArrayList([]Action).empty;
+            defer action_table.deinit(allocator);
             errdefer for (action_table.items) |row| {
                 allocator.free(row);
             };
-            var primary_productions_table = std.ArrayList([]ProductionInstance).init(allocator);
+            var primary_productions_table = std.ArrayList([]ProductionInstance).empty;
             defer {
                 for (primary_productions_table.items) |row| {
                     allocator.free(row);
                 }
-                primary_productions_table.deinit();
+                primary_productions_table.deinit(allocator);
             }
 
-            try goto_table.append(try allocator.alloc(Action, grammar.getVariableCount()));
-            try action_table.append(try allocator.alloc(Action, grammar.getTerminalCount()));
-            try primary_productions_table.append(try allocator.alloc(ProductionInstance, 1));
+            try goto_table.append(allocator, try allocator.alloc(Action, grammar.getVariableCount()));
+            try action_table.append(allocator, try allocator.alloc(Action, grammar.getTerminalCount()));
+            try primary_productions_table.append(allocator, try allocator.alloc(ProductionInstance, 1));
             primary_productions_table.items[0][0] = ProductionInstance.fromProduction(grammar.rules[grammar.getStartRuleId()]);
 
             var state: usize = 0;
             while (state < goto_table.items.len) : (state += 1) {
                 const variable_branches, const terminal_branches = try expandProductions(allocator, grammar, primary_productions_table.items[state]);
                 defer {
-                    for (variable_branches) |variable_prod_list| {
-                        variable_prod_list.deinit();
+                    for (0..variable_branches.len) |i| {
+                        variable_branches[i].deinit(allocator);
                     }
-                    for (terminal_branches) |terminal_prod_list| {
-                        terminal_prod_list.deinit();
+                    for (0..terminal_branches.len) |i| {
+                        terminal_branches[i].deinit(allocator);
                     }
                     allocator.free(variable_branches);
                     allocator.free(terminal_branches);
@@ -1298,9 +1297,9 @@ pub fn ParseTable(comptime Variable: type, comptime Terminal: type) type {
                             .accept => TableGeneratorError.shiftAcceptError,
                         };
                     } else {
-                        try goto_table.append(try allocator.alloc(Action, grammar.getVariableCount()));
-                        try action_table.append(try allocator.alloc(Action, grammar.getTerminalCount()));
-                        try primary_productions_table.append(try prod_list.toOwnedSlice());
+                        try goto_table.append(allocator, try allocator.alloc(Action, grammar.getVariableCount()));
+                        try action_table.append(allocator, try allocator.alloc(Action, grammar.getTerminalCount()));
+                        try primary_productions_table.append(allocator, try prod_list.toOwnedSlice(allocator));
                         goto_table.items[state][v_id] = Action{ .state = goto_table.items.len - 1 };
                     }
                 }
@@ -1319,9 +1318,9 @@ pub fn ParseTable(comptime Variable: type, comptime Terminal: type) type {
                             .accept => TableGeneratorError.shiftAcceptError,
                         };
                     } else {
-                        try goto_table.append(try allocator.alloc(Action, grammar.getVariableCount()));
-                        try action_table.append(try allocator.alloc(Action, grammar.getTerminalCount()));
-                        try primary_productions_table.append(try prod_list.toOwnedSlice());
+                        try goto_table.append(allocator, try allocator.alloc(Action, grammar.getVariableCount()));
+                        try action_table.append(allocator, try allocator.alloc(Action, grammar.getTerminalCount()));
+                        try primary_productions_table.append(allocator, try prod_list.toOwnedSlice(allocator));
                         action_table.items[state][t_id] = Action{ .state = action_table.items.len - 1 };
                     }
                 }
@@ -1367,7 +1366,7 @@ pub fn ParseTable(comptime Variable: type, comptime Terminal: type) type {
                     }
                 }
             }
-            return .{ try goto_table.toOwnedSlice(), try action_table.toOwnedSlice() };
+            return .{ try goto_table.toOwnedSlice(allocator), try action_table.toOwnedSlice(allocator) };
         }
 
         fn generateTablesComptime(comptime grammar: GrammarType) struct { []const []const Action, []const []const Action } {
@@ -1545,11 +1544,11 @@ test "ParseTable.expandProductions [grammar1.0]" {
     const start_productions = [_]ProductionInstance{ProductionInstance.fromProduction(grammar.rules[0])};
     const variable_branches, const terminal_branches = try P.expandProductions(std.testing.allocator, grammar, &start_productions);
     defer {
-        for (variable_branches) |variable_list| {
-            variable_list.deinit();
+        for (0..variable_branches.len) |i| {
+            variable_branches[i].deinit(std.testing.allocator);
         }
-        for (terminal_branches) |terminal_list| {
-            terminal_list.deinit();
+        for (0..terminal_branches.len) |i| {
+            terminal_branches[i].deinit(std.testing.allocator);
         }
         std.testing.allocator.free(variable_branches);
         std.testing.allocator.free(terminal_branches);
