@@ -1199,6 +1199,101 @@ test "first_and_follows [custom2]" {
     try std.testing.expectEqualSlices(bool, &expected_first_set, &first_set_comptime);
 }
 
+test "first_and_follows [custom3]" {
+    @setEvalBranchQuota(10000);
+    const V = TestVariable.fromString;
+    const T = CustomTestTerminal.fromString;
+    const G = Grammar(TestVariable, CustomTestTerminal);
+
+    const grammar = comptime G.initFromTuples(
+        .{
+            .{ V("S"), .{V("A")} },
+
+            .{ V("A"), .{ T("c"), V("B") } },
+            .{ V("A"), .{V("Q")} },
+            .{ V("A"), .{T("a")} },
+
+            .{ V("B"), .{ V("C"), T("b") } },
+
+            .{ V("C"), .{ V("A"), T("d") } },
+            .{ V("C"), .{V("D")} },
+
+            .{ V("D"), .{T("q")} },
+            .{ V("Q"), .{T("z")} },
+        },
+        V("S"),
+        T("$"),
+    );
+    defer grammar.deinit();
+
+    var allocator = std.testing.allocator;
+
+    const first_set = try grammar.getFirstSet(allocator);
+    defer allocator.free(first_set);
+
+    const first_set_comptime = comptime grammar.getFirstSetComptime();
+
+    const expected_first_set = comptime tableFromTuples(.{
+        .{ V("S"), .{ T("c"), T("a"), T("z") } },
+        .{ V("A"), .{ T("c"), T("a"), T("z") } },
+        .{ V("B"), .{ T("c"), T("a"), T("z"), T("q") } },
+        .{ V("C"), .{ T("c"), T("a"), T("z"), T("q") } },
+        .{ V("D"), .{T("q")} },
+        .{ V("Q"), .{T("z")} },
+    }, TestVariable, CustomTestTerminal, grammar);
+
+    try std.testing.expectEqualSlices(bool, &expected_first_set, first_set);
+    try std.testing.expectEqualSlices(bool, &expected_first_set, &first_set_comptime);
+}
+
+test "first_and_follows [custom4]" {
+    @setEvalBranchQuota(10000);
+    const V = TestVariable.fromString;
+    const T = CustomTestTerminal.fromString;
+    const G = Grammar(TestVariable, CustomTestTerminal);
+
+    const grammar = comptime G.initFromTuples(
+        .{
+            .{ V("S"), .{V("A")} },
+            .{ V("A"), .{ T("c"), V("B") } },
+            .{ V("A"), .{V("Q")} },
+            .{ V("A"), .{T("a")} },
+
+            .{ V("B"), .{ V("C"), T("b") } },
+
+            .{ V("C"), .{ V("A"), T("d") } },
+            .{ V("C"), .{V("D")} },
+
+            .{ V("D"), .{T("q")} },
+            .{ V("Q"), .{T("z")} },
+        },
+        V("S"),
+        T("$"),
+    );
+    defer grammar.deinit();
+
+    var allocator = std.testing.allocator;
+
+    const first_set = try grammar.getFirstSet(allocator);
+    defer allocator.free(first_set);
+
+    const first_set_comptime = comptime grammar.getFirstSetComptime();
+
+    const expected_first_set = comptime tableFromTuples(.{
+        .{ V("S"), .{ T("a"), T("z") } },
+        .{ V("A"), .{ T("a"), T("z") } },
+        .{ V("S"), .{ T("c"), T("a"), T("z") } },
+        .{ V("A"), .{ T("c"), T("a"), T("z") } },
+        .{ V("B"), .{ T("c"), T("a"), T("z"), T("q") } },
+        .{ V("C"), .{ T("c"), T("a"), T("z"), T("q") } },
+        .{ V("D"), .{T("q")} },
+        .{ V("Q"), .{T("z")} },
+    }, TestVariable, CustomTestTerminal, grammar);
+
+    try std.testing.expectEqualSlices(bool, &expected_first_set, first_set);
+    try std.testing.expectEqualSlices(bool, &expected_first_set, &first_set_comptime);
+}
+
 pub fn ParseTable(comptime Variable: type, comptime Terminal: type) type {
     return struct {
         const Self = @This();
