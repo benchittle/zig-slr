@@ -61,7 +61,6 @@ pub fn Grammar(comptime Variable: type, comptime Terminal: type) type {
     return struct {
         const Self = @This();
 
-        allocator: ?std.mem.Allocator, // TODO: Make this optional, remove initialized_at_comptime
         rules: []const Production,
         variables: []const Variable,
         terminals: []const Terminal,
@@ -80,7 +79,6 @@ pub fn Grammar(comptime Variable: type, comptime Terminal: type) type {
             comptime {
                 // Initialize a grammar struct to populate.
                 var grammar = Self{
-                    .allocator = null,
                     .rules = &[_]Production{},
                     .variables = &[_]Variable{start_variable},
                     .terminals = &[_]Terminal{},
@@ -143,12 +141,10 @@ pub fn Grammar(comptime Variable: type, comptime Terminal: type) type {
             }
         }
 
-        pub fn deinit(self: Self) void {
-            if (self.allocator) |allocator| {
-                allocator.free(self.rules);
-                allocator.free(self.variables);
-                allocator.free(self.terminals);
-            }
+        pub fn deinit(self: Self, allocator: std.mem.Allocator) void {
+            allocator.free(self.rules);
+            allocator.free(self.variables);
+            allocator.free(self.terminals);
         }
 
         /// Verify the structure and types of the given tuples. Return void
@@ -708,7 +704,6 @@ test "Grammar.initFromTuples [grammar1.0]" {
         V("S"),
         TestTerminal.End,
     );
-    defer actual_grammar.deinit();
 
     const r0 = Production{ .lhs = .{ .variable_id = V_S }, .rhs = &[_]SymbolId{.{ .variable_id = V_WFF }} };
     const r1 = Production{ .lhs = .{ .variable_id = V_WFF }, .rhs = &[_]SymbolId{.{ .terminal_id = T_PROPOSITION }} };
@@ -718,13 +713,11 @@ test "Grammar.initFromTuples [grammar1.0]" {
     const r5 = Production{ .lhs = .{ .variable_id = V_WFF }, .rhs = &[_]SymbolId{ .{ .terminal_id = T_LPAREN }, .{ .variable_id = V_WFF }, .{ .terminal_id = T_COND }, .{ .variable_id = V_WFF }, .{ .terminal_id = T_RPAREN } } };
     const r6 = Production{ .lhs = .{ .variable_id = V_WFF }, .rhs = &[_]SymbolId{ .{ .terminal_id = T_LPAREN }, .{ .variable_id = V_WFF }, .{ .terminal_id = T_BICOND }, .{ .variable_id = V_WFF }, .{ .terminal_id = T_RPAREN } } };
 
-    var expected_grammar = G{
-        .allocator = null,
+    const expected_grammar = G{
         .rules = &[_]Production{ r0, r1, r2, r3, r4, r5, r6 },
         .variables = &[_]TestVariable{ V("S"), V("wff") },
         .terminals = &[_]TestTerminal{ TestTerminal.Proposition, TestTerminal.Not, TestTerminal.LParen, TestTerminal.And, TestTerminal.RParen, TestTerminal.Or, TestTerminal.Cond, TestTerminal.Bicond, TestTerminal.End },
     };
-    defer expected_grammar.deinit();
 
     try std.testing.expectEqualDeep(expected_grammar.rules, actual_grammar.rules);
     try std.testing.expectEqualDeep(expected_grammar.variables, actual_grammar.variables);
@@ -789,7 +782,6 @@ test "Grammar.initFromTuples [grammar2.2]" {
         V("S"),
         TestTerminal.End,
     );
-    defer actual_grammar.deinit();
 
     const r0 = Production{ .lhs = .{ .variable_id = V_S }, .rhs = &[_]SymbolId{.{ .variable_id = V_WFF1 }} };
     const r1 = Production{ .lhs = .{ .variable_id = V_WFF1 }, .rhs = &[_]SymbolId{.{ .variable_id = V_WFF2 }} };
@@ -804,13 +796,11 @@ test "Grammar.initFromTuples [grammar2.2]" {
     const r10 = Production{ .lhs = .{ .variable_id = V_PROP }, .rhs = &[_]SymbolId{ .{ .terminal_id = T_LPAREN }, .{ .variable_id = V_WFF1 }, .{ .terminal_id = T_RPAREN } } };
     const r11 = Production{ .lhs = .{ .variable_id = V_PROP }, .rhs = &[_]SymbolId{.{ .terminal_id = T_PROPTOK }} };
 
-    var expected_grammar = G{
-        .allocator = null,
+    const expected_grammar = G{
         .rules = &[_]Production{ r0, r1, r2, r3, r4, r5, r6, r7, r8, r9, r10, r11 },
         .variables = &[_]TestVariable{ V("S"), V("wff1"), V("wff2"), V("wff3"), V("wff4"), V("prop") },
         .terminals = &[_]TestTerminal{ .Bicond, .Cond, .Or, .And, .Not, .LParen, .RParen, .Proposition, .End },
     };
-    defer expected_grammar.deinit();
 
     try std.testing.expectEqualDeep(expected_grammar.rules, actual_grammar.rules);
     try std.testing.expectEqualDeep(expected_grammar.variables, actual_grammar.variables);
@@ -831,7 +821,6 @@ test "firsts_and_follows [grammar1.0]" {
         .{ V("wff"), .{ TestTerminal.LParen, V("wff"), TestTerminal.Cond, V("wff"), TestTerminal.RParen } },
         .{ V("wff"), .{ TestTerminal.LParen, V("wff"), TestTerminal.Bicond, V("wff"), TestTerminal.RParen } },
     }, V("S"), TestTerminal.End);
-    defer grammar.deinit();
 
     var allocator = std.testing.allocator;
 
@@ -906,7 +895,6 @@ test "firsts_and_follows [grammar2.2]" {
         V("S"),
         TestTerminal.End,
     );
-    defer grammar.deinit();
 
     var allocator = std.testing.allocator;
 
@@ -994,7 +982,6 @@ test "first_and_follows [custom1]" {
         V("S"),
         T("$"),
     );
-    defer grammar.deinit();
 
     var allocator = std.testing.allocator;
 
@@ -1045,7 +1032,6 @@ test "first_and_follows [custom2]" {
         V("S"),
         T("$"),
     );
-    defer grammar.deinit();
 
     var allocator = std.testing.allocator;
 
@@ -1100,7 +1086,6 @@ test "first_and_follows [custom3]" {
         V("S"),
         T("$"),
     );
-    defer grammar.deinit();
 
     var allocator = std.testing.allocator;
 
@@ -1150,7 +1135,6 @@ test "first_and_follows [custom4]" {
         V("S"),
         T("$"),
     );
-    defer grammar.deinit();
 
     var allocator = std.testing.allocator;
 

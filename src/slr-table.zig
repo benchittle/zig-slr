@@ -566,7 +566,6 @@ test "ParseTable.expandProductions [grammar1.0]" {
         .{ V("wff"), .{ TestTerminal.LParen, V("wff"), TestTerminal.Cond, V("wff"), TestTerminal.RParen } },
         .{ V("wff"), .{ TestTerminal.LParen, V("wff"), TestTerminal.Bicond, V("wff"), TestTerminal.RParen } },
     }, V("S"), TestTerminal.End);
-    defer grammar.deinit();
 
     const P = ParseTable(TestVariable, TestTerminal);
 
@@ -644,7 +643,6 @@ test "Create parse table [grammar1.0]" {
         .{ V("wff"), .{ TestTerminal.LParen, V("wff"), TestTerminal.Cond, V("wff"), TestTerminal.RParen } },
         .{ V("wff"), .{ TestTerminal.LParen, V("wff"), TestTerminal.Bicond, V("wff"), TestTerminal.RParen } },
     }, V("S"), TestTerminal.End);
-    defer grammar.deinit();
 
     const P = ParseTable(TestVariable, TestTerminal);
 
@@ -745,7 +743,6 @@ test "Create parse table [grammar2.0]" {
         V("S"),
         TestTerminal.End,
     );
-    defer grammar.deinit();
 
     const P = ParseTable(TestVariable, TestTerminal);
 
