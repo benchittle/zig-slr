@@ -1,6 +1,8 @@
 const std = @import("std");
 const debug = std.debug;
 
+const utils = @import("utils.zig");
+
 const stdout = std.io.getStdOut().writer();
 
 pub const TableGeneratorError = error{
@@ -31,23 +33,23 @@ fn strStrip(ascii_string: []u8) []u8 {
     return ascii_string[start..end];
 }
 
-//const SymbolIdx = i32;
-
-const Symbol = union(enum) {
+const SymbolId = union(enum) {
     const Self = @This();
+    const VariableId = u16;
+    const TerminalId = u16;
 
-    variable: u16,
-    terminal: u16,
+    variable_id: VariableId,
+    terminal_id: TerminalId,
 
     fn eql(self: Self, other: Self) bool {
         return switch (self) {
-            .variable => |idx1| switch (other) {
-                .variable => |idx2| idx1 == idx2,
-                .terminal => false,
+            .variable_id => |id1| switch (other) {
+                .variable_id => |id2| id1 == id2,
+                .terminal_id => false,
             },
-            .terminal => |idx1| switch (other) {
-                .variable => false,
-                .terminal => |idx2| idx1 == idx2,
+            .terminal_id => |id1| switch (other) {
+                .variable_id => false,
+                .terminal_id => |id2| id1 == id2,
             },
         };
     }
@@ -58,8 +60,8 @@ const Production = struct {
     // allocated strings
     const Self = @This();
 
-    lhs: Symbol,
-    rhs: []const Symbol,
+    lhs: SymbolId,
+    rhs: []const SymbolId,
 
     fn eql(self: Self, other: Self) bool {
         if (!self.lhs.eql(other.lhs)) return false;
@@ -86,7 +88,7 @@ const ProductionInstance = struct {
         return self.cursor == other.cursor and self.production.eql(other.production);
     }
 
-    fn readCursor(self: Self) ?Symbol {
+    fn readCursor(self: Self) ?SymbolId {
         if (self.cursor >= self.production.rhs.len) {
             return null;
         } else {
@@ -112,7 +114,7 @@ pub fn Grammar(comptime Variable: type, comptime Terminal: type) type {
         variables: []const Variable,
         terminals: []const Terminal,
 
-        pub fn initFromTuples(comptime rule_tuples: anytype, comptime start_variable: Variable, comptime end_token: Terminal) Self {
+        pub fn initFromTuples(comptime rule_tuples: anytype, comptime start_variable: Variable, comptime end_terminal: Terminal) Self {
             comptime {
                 // Initialize a grammar struct to populate.
                 var grammar = Self{
@@ -131,18 +133,18 @@ pub fn Grammar(comptime Variable: type, comptime Terminal: type) type {
                     // Initialize a rule struct to populate.
                     var rule = Production{
                         .lhs = undefined,
-                        .rhs = &[_]Symbol{},
+                        .rhs = &[_]SymbolId{},
                     };
 
                     // Unpack the left hand side of the rule. We have already
-                    // checked that it is of type V.
+                    // checked that it is of type Variable.
                     const lhs = rule_tuple.@"0";
-                    if (grammar.getSymbolFromVariable(lhs)) |id| {
+                    if (grammar.getSymbolIdFromVariable(lhs)) |id| {
                         rule.lhs = id;
                     } else {
                         // If we haven't seen this variable yet, append it to
                         // the variables list.
-                        rule.lhs = grammar.getVariableCount();
+                        rule.lhs = SymbolId{ .variable_id = grammar.getVariableCount() };
                         grammar.variables = grammar.variables ++ &[_]Variable{lhs};
                     }
 
@@ -150,31 +152,31 @@ pub fn Grammar(comptime Variable: type, comptime Terminal: type) type {
                     // rule tuple and unpack each into the grammar rule.
                     const rhs = rule_tuple.@"1";
                     for (std.meta.fieldNames(@TypeOf(rhs))) |rhs_tuple_field_name| {
-                        const var_or_token = @field(rhs, rhs_tuple_field_name);
-                        if (@TypeOf(var_or_token) == Variable) {
-                            if (grammar.getSymbolFromVariable(var_or_token)) |symbol| {
-                                rule.rhs = rule.rhs ++ &[_]Symbol{symbol};
+                        const var_or_terminal = @field(rhs, rhs_tuple_field_name);
+                        if (@TypeOf(var_or_terminal) == Variable) {
+                            if (grammar.getSymbolIdFromVariable(var_or_terminal)) |symbol| {
+                                rule.rhs = rule.rhs ++ &[_]SymbolId{symbol};
                             } else {
                                 // If we haven't seen this variable yet, append
                                 // it to the variables list.
-                                rule.rhs = rule.rhs ++ &[_]Symbol{Symbol{ .variable = grammar.getVariableCount() }};
-                                grammar.variables = grammar.variables ++ &[_]Variable{var_or_token};
+                                rule.rhs = rule.rhs ++ &[_]SymbolId{SymbolId{ .variable_id = grammar.getVariableCount() }};
+                                grammar.variables = grammar.variables ++ &[_]Variable{var_or_terminal};
                             }
                         } else {
-                            if (grammar.getSymbolFromTerminal(var_or_token)) |symbol| {
-                                rule.rhs = rule.rhs ++ &[_]Symbol{symbol};
+                            if (grammar.getSymbolIdFromTerminal(var_or_terminal)) |symbol| {
+                                rule.rhs = rule.rhs ++ &[_]SymbolId{symbol};
                             } else {
                                 // If we haven't seen this terminal yet, append
                                 // it to the terminals list.
-                                rule.rhs = rule.rhs ++ &[_]Symbol{Symbol{ .terminal = grammar.getTerminalCount() }};
-                                grammar.terminals = grammar.terminals ++ &[_]Terminal{var_or_token};
+                                rule.rhs = rule.rhs ++ &[_]SymbolId{SymbolId{ .terminal_id = grammar.getTerminalCount() }};
+                                grammar.terminals = grammar.terminals ++ &[_]Terminal{var_or_terminal};
                             }
                         }
                     }
                     // Append the populated rule.
                     grammar.rules = grammar.rules ++ &[_]Production{rule};
                 }
-                grammar.terminals = grammar.terminals ++ &[_]Terminal{end_token};
+                grammar.terminals = grammar.terminals ++ &[_]Terminal{end_terminal};
                 return grammar;
             }
         }
@@ -190,7 +192,7 @@ pub fn Grammar(comptime Variable: type, comptime Terminal: type) type {
         /// Verify the structure and types of the given tuples. Return void
         /// since this will be done at comptime and all errors will be compiler
         /// errors.
-        /// TODO: Consider removing 
+        /// TODO: Consider removing
         fn verifyTuples(comptime rule_tuples: anytype) void {
             const RuleTuplesType = @TypeOf(rule_tuples);
             const rule_tuples_type_info = @typeInfo(RuleTuplesType);
@@ -251,7 +253,7 @@ pub fn Grammar(comptime Variable: type, comptime Terminal: type) type {
             }
         }
 
-        pub fn getRuleIdx(self: Self, rule: Production) ?usize {
+        pub fn getRuleId(self: Self, rule: Production) ?usize {
             for (self.rules, 0..) |known_rule, i| {
                 if (known_rule.eql(rule)) {
                     return i;
@@ -260,86 +262,78 @@ pub fn Grammar(comptime Variable: type, comptime Terminal: type) type {
             return null;
         }
 
-        pub fn getVariableCount(self: Self) usize {
-            return self.variables.len;
+        pub fn getVariableCount(self: Self) SymbolId.VariableId {
+            return @intCast(self.variables.len);
         }
 
-        pub fn getTerminalCount(self: Self) usize {
-            return self.terminals.len;
+        pub fn getTerminalCount(self: Self) SymbolId.TerminalId {
+            return @intCast(self.terminals.len);
         }
 
         pub fn getSymbolCount(self: Self) usize {
             return self.getVariableCount() + self.getTerminalCount();
         }
 
-        pub fn getSymbolFromVariable(self: Self, variable: Variable) ?Symbol {
-            for (self.variables, 0..) |v, variable_idx| {
+        pub fn getSymbolIdFromVariable(self: Self, variable: Variable) ?SymbolId {
+            for (self.variables, 0..) |v, variable_id| {
                 if (variable.eql(v)) {
-                    return Symbol{ .variable = @intCast(variable_idx) };
+                    return SymbolId{ .variable_id = @intCast(variable_id) };
                 }
             }
             return null;
         }
 
-        pub fn getSymbolFromTerminal(self: Self, terminal: Terminal) ?Symbol {
-            for (self.terminals, 0..) |t, terminal_idx| {
+        pub fn getSymbolIdFromTerminal(self: Self, terminal: Terminal) ?SymbolId {
+            for (self.terminals, 0..) |t, terminal_id| {
                 if (terminal.eql(t)) {
-                    return Symbol{ .terminal = @intCast(terminal_idx) };
+                    return SymbolId{ .terminal_id = @intCast(terminal_id) };
                 }
             }
             return null;
         }
 
-        // fn getOffsetIdx(self: Self, idx: @TypeOf(Symbol.terminal)) @TypeOf(Symbol.terminal) {
-        //     return self.getVariableCount() + idx;
-        // }
-
-        pub fn getStartSymbol(_: Self) Symbol {
-            return Symbol{ .variable = 0};
+        /// Returns variable with index 0.
+        pub fn getStartSymbolId(_: Self) SymbolId {
+            return SymbolId{ .variable_id = 0 };
         }
 
-        pub fn getEndSymbol(self: Self) Symbol {
-            return Symbol{ .terminal = @intCast(self.getTerminalCount() - 1)};
+        pub fn getEndSymbolId(self: Self) SymbolId {
+            return SymbolId{ .terminal_id = @intCast(self.getTerminalCount() - 1) };
         }
 
-        pub fn getStartRuleIdx(_: Self) usize {
+        pub fn getStartRuleId(_: Self) usize {
             return 0;
         }
 
-        pub fn getRule(self: Self, rule_idx: usize) Production {
-            return self.rules[rule_idx];
+        pub fn getRule(self: Self, rule_id: usize) Production {
+            return self.rules[rule_id];
         }
 
-        // NOTE: $ (END character) can never be first
-        // TODO: Make a Set struct so that we can abstract away the operations
-        // and use different internal representations with the same interface
-        // (in case I want to change the representation in the future)
-        pub fn getFirstSet(self: Self, allocator: std.mem.Allocator) ![][]bool {
-            var firsts = try allocator.alloc([]bool, self.getVariableCount());
-            errdefer allocator.free(firsts);
-            var num_firsts_allocated: usize = 0;
-            for (0..firsts.len) |i| {
-                firsts[i] = try allocator.alloc(bool, self.getTerminalCount());
-                for (0..firsts[i].len) |j| {
-                    firsts[i][j] = false; // Set default state to false, including for $
-                }
-                num_firsts_allocated += 1;
-            }
-            errdefer for (firsts[0..num_firsts_allocated]) |list| {
-                allocator.free(list);
-            };
+        /// Caller must provide buffers with the necessary room:
+        /// * `first_set: [self.getVariableCount() * self.getTerminalCount()]bool`
+        /// * `seen: [self.getVariableCount()]bool`
+        /// * `stack_buffer: [self.getVariableCount()]Symbol`
+        ///
+        /// `first_set` is populated with the resulting table, the other buffers
+        /// can be freed immediately if they were dynamically allocated.
+        fn computeFirstSet(
+            self: Self,
+            first_set: []bool,
+            seen: []bool,
+            stack_buffer: []Symbol,
+        ) void {
+            std.debug.assert(first_set.len >= self.getVariableCount() * self.getTerminalCount());
+            std.debug.assert(seen.len >= self.getVariableCount());
+            std.debug.assert(stack_buffer.len >= self.getVariableCount());
 
-            // Iterate over all variable ID's
+            @memset(first_set, false);
+            var first_set_2d_view = utils.Slice2d([]bool).init(first_set, self.getTerminalCount());
+
             for (0..self.getVariableCount()) |v_idx| {
-                var seen = try allocator.alloc(bool, self.getVariableCount());
-                defer allocator.free(seen);
-                for (0..seen.len) |i| {
-                    seen[i] = false;
-                }
+                @memset(seen, false);
                 seen[v_idx] = true;
 
-                var stack = try std.ArrayList(Symbol).initCapacity(allocator, self.getVariableCount());
-                defer stack.deinit();
+                var stack = std.ArrayListUnmanaged(Symbol).initBuffer(stack_buffer);
                 stack.appendAssumeCapacity(Symbol{ .variable = @intCast(v_idx) });
 
                 while (stack.pop()) |top_symbol| {
@@ -349,120 +343,96 @@ pub fn Grammar(comptime Variable: type, comptime Terminal: type) type {
                         }
                         const first_rule_symbol = rule.rhs[0];
                         switch (first_rule_symbol) {
-                            .terminal => |idx| firsts[v_idx][idx] = true,
+                            .terminal => |idx| first_set_2d_view.row(v_idx)[idx] = true,
                             .variable => |idx| {
                                 if (seen[idx]) {
                                     continue;
                                 }
-                                if (idx < v_idx) { // entry already populated
-                                    // TODO: Make union function?
-                                    for (firsts[idx], 0..) |isInFirstList, i| {
-                                        if (isInFirstList) {
-                                            firsts[v_idx][i] = true;
+                                if (idx < v_idx) {
+                                    for (first_set_2d_view.row(idx), 0..) |is_in_first_list, i| {
+                                        if (is_in_first_list) {
+                                            first_set_2d_view.row(v_idx)[i] = true;
                                         }
                                     }
                                 } else {
                                     stack.appendAssumeCapacity(first_rule_symbol);
                                 }
                                 seen[idx] = true;
-                            },
+                            }
                         }
                     }
                 }
             }
-            return firsts;
         }
 
-        // NOTE: $ (END character) can never be first
-        pub fn getFirstSetComptime(comptime self: Self) []const []const bool {
+        /// Computes the FIRST set for the grammar as a table. Each row
+        /// represents a grammar variable, each column a grammar terminal. If
+        /// row x, column y is true, then the y'th terminal is in the x'th
+        /// variable's FIRST set.
+        ///
+        /// The returned slice should be interpreted as a row-wise 2D array as
+        /// described above. Caller must free.
+        ///
+        /// NOTE: $ (END character) can never be first
+        pub fn getFirstSet(self: Self, allocator: std.mem.Allocator) ![]bool {
+            const first_set_buffer = try allocator.alloc(bool, self.getVariableCount() * self.getTerminalCount());
+            errdefer allocator.free(first_set_buffer);
+            const seen_buffer = try allocator.alloc(bool, self.getVariableCount());
+            defer allocator.free(seen_buffer);
+            const stack_buffer = try allocator.alloc(Symbol, self.getVariableCount());
+            defer allocator.free(stack_buffer);
+
+            self.computeFirstSet(first_set_buffer, seen_buffer, stack_buffer);
+            return first_set_buffer;
+        }
+
+        /// Comptime version of `getFirstSet()`, no dynamic allocation needed.
+        pub fn getFirstSetComptime(comptime self: Self) [self.getVariableCount() * self.getTerminalCount()]bool {
             comptime {
-                var firsts = [_][self.getTerminalCount()]bool {[_]bool{false} ** self.getTerminalCount()} ** self.getVariableCount();
+                var first_set_buffer: [self.getVariableCount() * self.getTerminalCount()]bool = undefined;
+                var seen_buffer: [self.getVariableCount()]bool = undefined;
+                var stack_buffer: [self.getVariableCount()]Symbol = undefined;
 
-                // Iterate over all variable ID's
-                for (0..self.getVariableCount()) |v_idx| {
-                    var seen = [_]bool{false} ** self.getVariableCount();
-                    seen[v_idx] = true;
-
-                    var stack: []const Symbol = &[_]Symbol{Symbol{ .variable = @intCast(v_idx) }};
-
-                    while (stack.len > 0) {
-                        const top_symbol = stack[stack.len - 1];
-                        stack = stack[0 .. stack.len - 1];
-
-                        for (self.rules) |rule| {
-                            if (!rule.lhs.eql(top_symbol)) {
-                                continue;
-                            }
-                            const first_rule_symbol = rule.rhs[0];
-                            switch (first_rule_symbol) {
-                                .terminal => |idx| firsts[v_idx][idx] = true,
-                                .variable => |idx| {
-                                    if (seen[idx]) {
-                                        continue;
-                                    }
-                                    if (idx < v_idx) { // entry already populated
-                                        // TODO: Make union function?
-                                        for (firsts[idx], 0..) |isInFirstList, i| {
-                                            if (isInFirstList) {
-                                                firsts[v_idx][i] = true;
-                                            }
-                                        }
-                                    } else {
-                                        stack = stack ++ &[_]Symbol{first_rule_symbol};
-                                    }
-                                    seen[idx] = true;
-                                },
-                            }
-                        }
-                    }
-                }
-                const firsts_const = firsts;
-                var firsts_as_slices = [_][]const bool{undefined} ** firsts_const.len;
-                for (0..firsts_const.len) |i| {
-                    firsts_as_slices[i] = &firsts_const[i];
-                }
-                const firsts_as_slices_const = firsts_as_slices;
-                return &firsts_as_slices_const;
+                self.computeFirstSet(&first_set_buffer, &seen_buffer, &stack_buffer);
+                return first_set_buffer;
             }
         }
 
-        // NOTE: Assumes $ is last terminal symbol ID and S' is the first symbol ID
-        //       (0). FOLLOW(S') will be initialized to {$}, which will then be
-        //       propogated as needed
-        pub fn getFollowSet(self: Self, allocator: std.mem.Allocator) ![][] bool {
-            const first_set = try self.getFirstSet(allocator);
-            defer {
-                for (first_set) |row| allocator.free(row);
-                allocator.free(first_set);
-            }
+        /// Caller must provide buffers with the necessary room:
+        /// * `follow_set: [self.getVariableCount() * self.getTerminalCount()]bool`
+        /// * `seen: [self.getVariableCount()]bool`
+        /// * `stack_buffer: [self.getVariableCount()]Symbol`
+        ///
+        /// Caller must also provide a **populated** `first_set` table.
+        ///
+        /// `follow_set` is populated with the resulting table, the other buffers
+        /// can be freed immediately if they were dynamically allocated.
+        fn computeFollowSet(
+            self: Self,
+            follow_set: []bool,
+            seen: []bool,
+            stack_buffer: []SymbolId,
+            first_set: []const bool,
+        ) void {
+            std.debug.assert(follow_set.len >= self.getVariableCount() * self.getTerminalCount());
+            std.debug.assert(seen.len >= self.getVariableCount());
+            std.debug.assert(stack_buffer.len >= self.getVariableCount());
+            std.debug.assert(first_set.len >= self.getVariableCount() * self.getTerminalCount());
 
-            var follow_set = try allocator.alloc([]bool, self.getVariableCount());
-            errdefer allocator.free(follow_set);
-            var num_follow_allocated: usize = 0;
-            for (0..follow_set.len) |i| {
-                follow_set[i] = try allocator.alloc(bool, self.getTerminalCount());
-                for (0..follow_set[i].len) |j| {
-                    follow_set[i][j] = false;
-                }
-                num_follow_allocated += 1;
-            }
+            const first_set_2d_view = utils.Slice2d([]const bool).init(first_set, self.getTerminalCount());
+
+            @memset(follow_set, false);
+            var follow_set_2d_view = utils.Slice2d([]bool).init(follow_set, self.getTerminalCount());
+
             // Initialize FOLLOW(startsymbol) to include end of input symbol.
-            errdefer for (follow_set[0..num_follow_allocated]) |list| {
-                allocator.free(list);
-            };
-            follow_set[0][self.getTerminalCount() - 1] = true;
+            follow_set_2d_view.row(0)[follow_set_2d_view.row_length - 1] = true;
 
-            for (0..self.getVariableCount()) |v_idx| {
-                var seen = try allocator.alloc(bool, self.getVariableCount());
-                defer allocator.free(seen);
-                for (0..seen.len) |i| {
-                    seen[i] = false;
-                }
-                seen[v_idx] = true; // redundant?
+            for (0..self.getVariableCount()) |v_id| {
+                @memset(seen, false);
+                seen[v_id] = true; // redundant?
 
-                var stack = try std.ArrayList(Symbol).initCapacity(allocator, self.getVariableCount());
-                defer stack.deinit();
-                stack.appendAssumeCapacity(Symbol{ .variable = @intCast(v_idx) });
+                var stack = std.ArrayListUnmanaged(SymbolId).initBuffer(stack_buffer);
+                stack.appendAssumeCapacity(SymbolId{ .variable_id = @intCast(v_id) });
 
                 while (stack.pop()) |top_symbol| {
                     for (self.rules) |rule| {
@@ -472,121 +442,97 @@ pub fn Grammar(comptime Variable: type, comptime Terminal: type) type {
                             }
 
                             switch (rule.rhs[i + 1]) {
-                                .terminal => |idx| follow_set[v_idx][idx] = true,
+                                .terminal_id => |id| follow_set_2d_view.row(v_id)[id] = true,
                                 // TODO: Make union function?
-                                .variable => |idx| for (first_set[idx], 0..) |isFirst, terminal_idx| {
-                                    if (isFirst) {
-                                        follow_set[v_idx][terminal_idx] = true;
+                                .variable_id => |id| for (first_set_2d_view.row(id), 0..) |is_first, terminal_id| {
+                                    if (is_first) {
+                                        follow_set_2d_view.row(v_id)[terminal_id] = true;
                                     }
                                 },
                             }
                         }
 
-                        // Handle the last RHS symbol separetly //
+                        // Handle the last RHS symbol separatly //
 
                         const last_rhs_symbol = rule.rhs[rule.rhs.len - 1];
-                        if (!last_rhs_symbol.eql(top_symbol) or seen[rule.lhs.variable]) {
+                        if (!last_rhs_symbol.eql(top_symbol) or seen[rule.lhs.variable_id]) {
                             continue;
                         }
                         // Check if we already have the Follow set for this variable
                         // TODO: Make this more explicit?
-                        if (rule.lhs.variable < v_idx) {
-                            for (follow_set[rule.lhs.variable], 0..) |isFollow, terminal_idx| {
-                                if (isFollow) {
-                                    follow_set[v_idx][terminal_idx] = true;
+                        if (rule.lhs.variable_id < v_id) {
+                            for (follow_set_2d_view.row(rule.lhs.variable_id), 0..) |is_follow, terminal_id| {
+                                if (is_follow) {
+                                    follow_set_2d_view.row(v_id)[terminal_id] = true;
                                 }
                             }
                         } else {
                             stack.appendAssumeCapacity(rule.lhs);
                         }
-                        seen[rule.lhs.variable] = true;
+                        seen[rule.lhs.variable_id] = true;
                     }
                 }
             }
-            return follow_set;
         }
 
-        pub fn getFollowSetComptime(comptime self: Self) []const []const bool {
+        /// Computes the FOLLOW set for the grammar as a table. Each row
+        /// represents a grammar variable, each column a grammar terminal. If
+        /// row x, column y is true, then the y'th terminal is in the x'th
+        /// variable's FOLLOW set.
+        ///
+        /// The returned slice should be interpreted as a row-wise 2D array as
+        /// described above. Caller must free.
+        ///
+        /// NOTE: Assumes $ is last terminal symbol ID and S' is the first
+        ///       symbol ID (0). FOLLOW(S') will be initialized to {$}, which
+        ///       will then be propogated as needed.
+        pub fn getFollowSet(self: Self, allocator: std.mem.Allocator) ![]bool {
+            const first_set_buffer = try allocator.alloc(bool, self.getVariableCount() * self.getTerminalCount());
+            defer allocator.free(first_set_buffer);
+            const seen_buffer = try allocator.alloc(bool, self.getVariableCount());
+            defer allocator.free(seen_buffer);
+            const stack_buffer = try allocator.alloc(Symbol, self.getVariableCount());
+            defer allocator.free(stack_buffer);
+
+            self.computeFirstSet(first_set_buffer, seen_buffer, stack_buffer);
+
+            const follow_set_buffer = try allocator.alloc(bool, self.getVariableCount() * self.getTerminalCount());
+            errdefer allocator.free(follow_set_buffer);
+
+            self.computeFollowSet(follow_set_buffer, seen_buffer, stack_buffer, first_set_buffer);
+            return follow_set_buffer;
+        }
+
+        /// Comptime version of `getFollowSet()`, no dynamic allocation needed.
+        pub fn getFollowSetComptime(comptime self: Self) [self.getVariableCount() * self.getTerminalCount()]bool {
             comptime {
-                const first_set = self.getFirstSetComptime();
+                var first_set_buffer: [self.getVariableCount() * self.getTerminalCount()]bool = undefined;
+                var seen_buffer: [self.getVariableCount()]bool = undefined;
+                var stack_buffer: [self.getVariableCount()]Symbol = undefined;
 
-                var follow_set = [_][self.getTerminalCount()]bool {[_]bool{false} ** self.getTerminalCount()} ** self.getVariableCount();
+                self.computeFirstSet(&first_set_buffer, &seen_buffer, &stack_buffer);
 
-                // Initialize FOLLOW(startsymbol) to include end of input symbol.
-                follow_set[0][self.getTerminalCount() - 1] = true;
+                var follow_set_buffer: [self.getVariableCount() * self.getTerminalCount()]bool = undefined;
 
-                for (0..self.getVariableCount()) |v_idx| {
-                    var seen = [_]bool{false} ** self.getVariableCount();
-                    seen[v_idx] = true; // redundant?
-
-                    var stack: []const Symbol = &[_]Symbol{Symbol{ .variable = @intCast(v_idx) }};
-
-                    while (stack.len > 0) {
-                        const top_symbol = stack[stack.len - 1];
-                        stack = stack[0 .. stack.len - 1];
-
-                        for (self.rules) |rule| {
-                            for (rule.rhs[0 .. rule.rhs.len - 1], 0..) |rhs_symbol, i| {
-                                if (!rhs_symbol.eql(top_symbol)) {
-                                    continue;
-                                }
-
-                                switch (rule.rhs[i + 1]) {
-                                    .terminal => |idx| follow_set[v_idx][idx] = true,
-                                    // TODO: Make union function?
-                                    .variable => |idx| for (first_set[idx], 0..) |isFirst, terminal_idx| {
-                                        if (isFirst) {
-                                            follow_set[v_idx][terminal_idx] = true;
-                                        }
-                                    },
-                                }
-                            }
-
-                            // Handle the last RHS symbol separetly //
-
-                            const last_rhs_symbol = rule.rhs[rule.rhs.len - 1];
-                            if (!last_rhs_symbol.eql(top_symbol) or seen[rule.lhs.variable]) {
-                                continue;
-                            }
-                            // Check if we already have the Follow set for this variable
-                            // TODO: Make this more explicit?
-                            if (rule.lhs.variable < v_idx) {
-                                for (follow_set[rule.lhs.variable], 0..) |isFollow, terminal_idx| {
-                                    if (isFollow) {
-                                        follow_set[v_idx][terminal_idx] = true;
-                                    }
-                                }
-                            } else {
-                                stack = stack ++ &[_]Symbol{rule.lhs};
-                            }
-                            seen[rule.lhs.variable] = true;
-                        }
-                    }
-                }
-                const follow_set_const = follow_set;
-                var follow_set_as_slices = [_][]const bool{undefined} ** follow_set_const.len;
-                for (0..follow_set_const.len) |i| {
-                    follow_set_as_slices[i] = &follow_set_const[i];
-                }
-                const follow_set_as_slices_const = follow_set_as_slices;
-                return &follow_set_as_slices_const;
+                self.computeFollowSet(&follow_set_buffer, &seen_buffer, &stack_buffer, &first_set_buffer);
+                return follow_set_buffer;
             }
         }
 
         fn printDebugProductionInstance(_: Self, prod: ProductionInstance) !void {
-            debug.print("({d})", .{prod.production.lhs.variable});
+            debug.print("({d})", .{prod.production.lhs.variable_id});
             debug.print(" ->", .{});
             for (prod.production.rhs[0..prod.cursor]) |sym| {
                 switch (sym) {
-                    .variable => |idx| debug.print(" ({d})", .{idx}),
-                    .terminal => |idx| debug.print(" {d}", .{idx}),
+                    .variable_id => |id| debug.print(" ({d})", .{id}),
+                    .terminal_id => |id| debug.print(" {d}", .{id}),
                 }
             }
             debug.print(" *", .{});
             for (prod.production.rhs[prod.cursor..]) |sym| {
                 switch (sym) {
-                    .variable => |idx| debug.print(" ({d})", .{idx}),
-                    .terminal => |idx| debug.print(" {d}", .{idx}),
+                    .variable_id => |id| debug.print(" ({d})", .{id}),
+                    .terminal_id => |id| debug.print(" {d}", .{id}),
                 }
             }
             debug.print("\n", .{});
@@ -623,6 +569,24 @@ const TestTerminal = enum {
             .Bicond => "<=>",
             .End => "$",
         };
+    }
+};
+
+const CustomTestTerminal = struct {
+    const Self = @This();
+
+    name: []const u8,
+
+    fn fromString(string: []const u8) Self {
+        return Self{ .name = string };
+    }
+
+    fn getString(self: Self) []const u8 {
+        return self.name;
+    }
+
+    fn eql(self: Self, other: Self) bool {
+        return std.mem.eql(u8, self.name, other.name);
     }
 };
 
@@ -682,13 +646,13 @@ test "Grammar.initFromTuples [grammar1.0]" {
     );
     defer actual_grammar.deinit();
 
-    const r0 = Production{ .lhs = .{ .variable = V_S }, .rhs = &[_]Symbol{.{ .variable = V_WFF }} };
-    const r1 = Production{ .lhs = .{ .variable = V_WFF }, .rhs = &[_]Symbol{.{ .terminal = T_PROPOSITION }} };
-    const r2 = Production{ .lhs = .{ .variable = V_WFF }, .rhs = &[_]Symbol{ .{ .terminal = T_NOT }, .{ .variable = V_WFF } } };
-    const r3 = Production{ .lhs = .{ .variable = V_WFF }, .rhs = &[_]Symbol{ .{ .terminal = T_LPAREN }, .{ .variable = V_WFF }, .{ .terminal = T_AND }, .{ .variable = V_WFF }, .{ .terminal = T_RPAREN } } };
-    const r4 = Production{ .lhs = .{ .variable = V_WFF }, .rhs = &[_]Symbol{ .{ .terminal = T_LPAREN }, .{ .variable = V_WFF }, .{ .terminal = T_OR }, .{ .variable = V_WFF }, .{ .terminal = T_RPAREN } } };
-    const r5 = Production{ .lhs = .{ .variable = V_WFF }, .rhs = &[_]Symbol{ .{ .terminal = T_LPAREN }, .{ .variable = V_WFF }, .{ .terminal = T_COND }, .{ .variable = V_WFF }, .{ .terminal = T_RPAREN } } };
-    const r6 = Production{ .lhs = .{ .variable = V_WFF }, .rhs = &[_]Symbol{ .{ .terminal = T_LPAREN }, .{ .variable = V_WFF }, .{ .terminal = T_BICOND }, .{ .variable = V_WFF }, .{ .terminal = T_RPAREN } } };
+    const r0 = Production{ .lhs = .{ .variable_id = V_S }, .rhs = &[_]SymbolId{.{ .variable_id = V_WFF }} };
+    const r1 = Production{ .lhs = .{ .variable_id = V_WFF }, .rhs = &[_]SymbolId{.{ .terminal_id = T_PROPOSITION }} };
+    const r2 = Production{ .lhs = .{ .variable_id = V_WFF }, .rhs = &[_]SymbolId{ .{ .terminal_id = T_NOT }, .{ .variable_id = V_WFF } } };
+    const r3 = Production{ .lhs = .{ .variable_id = V_WFF }, .rhs = &[_]SymbolId{ .{ .terminal_id = T_LPAREN }, .{ .variable_id = V_WFF }, .{ .terminal_id = T_AND }, .{ .variable_id = V_WFF }, .{ .terminal_id = T_RPAREN } } };
+    const r4 = Production{ .lhs = .{ .variable_id = V_WFF }, .rhs = &[_]SymbolId{ .{ .terminal_id = T_LPAREN }, .{ .variable_id = V_WFF }, .{ .terminal_id = T_OR }, .{ .variable_id = V_WFF }, .{ .terminal_id = T_RPAREN } } };
+    const r5 = Production{ .lhs = .{ .variable_id = V_WFF }, .rhs = &[_]SymbolId{ .{ .terminal_id = T_LPAREN }, .{ .variable_id = V_WFF }, .{ .terminal_id = T_COND }, .{ .variable_id = V_WFF }, .{ .terminal_id = T_RPAREN } } };
+    const r6 = Production{ .lhs = .{ .variable_id = V_WFF }, .rhs = &[_]SymbolId{ .{ .terminal_id = T_LPAREN }, .{ .variable_id = V_WFF }, .{ .terminal_id = T_BICOND }, .{ .variable_id = V_WFF }, .{ .terminal_id = T_RPAREN } } };
 
     var expected_grammar = G{
         .allocator = null,
@@ -760,18 +724,18 @@ test "Grammar.initFromTuples [grammar2.2]" {
     );
     defer actual_grammar.deinit();
 
-    const r0 = Production{ .lhs = .{ .variable = V_S }, .rhs = &[_]Symbol{.{ .variable = V_WFF1 }} };
-    const r1 = Production{ .lhs = .{ .variable = V_WFF1 }, .rhs = &[_]Symbol{.{ .variable = V_WFF2 }} };
-    const r2 = Production{ .lhs = .{ .variable = V_WFF1 }, .rhs = &[_]Symbol{ .{ .variable = V_WFF1 }, .{ .terminal = T_BICOND }, .{ .variable = V_WFF2 } } };
-    const r3 = Production{ .lhs = .{ .variable = V_WFF2 }, .rhs = &[_]Symbol{.{ .variable = V_WFF3 }} };
-    const r4 = Production{ .lhs = .{ .variable = V_WFF2 }, .rhs = &[_]Symbol{ .{ .variable = V_WFF2 }, .{ .terminal = T_COND }, .{ .variable = V_WFF3 } } };
-    const r5 = Production{ .lhs = .{ .variable = V_WFF3 }, .rhs = &[_]Symbol{.{ .variable = V_WFF4 }} };
-    const r6 = Production{ .lhs = .{ .variable = V_WFF3 }, .rhs = &[_]Symbol{ .{ .variable = V_WFF3 }, .{ .terminal = T_OR }, .{ .variable = V_WFF4 } } };
-    const r7 = Production{ .lhs = .{ .variable = V_WFF3 }, .rhs = &[_]Symbol{ .{ .variable = V_WFF3 }, .{ .terminal = T_AND }, .{ .variable = V_WFF4 } } };
-    const r8 = Production{ .lhs = .{ .variable = V_WFF4 }, .rhs = &[_]Symbol{.{ .variable = V_PROP }} };
-    const r9 = Production{ .lhs = .{ .variable = V_WFF4 }, .rhs = &[_]Symbol{ .{ .terminal = T_NOT }, .{ .variable = V_WFF4 } } };
-    const r10 = Production{ .lhs = .{ .variable = V_PROP }, .rhs = &[_]Symbol{ .{ .terminal = T_LPAREN }, .{ .variable = V_WFF1 }, .{ .terminal = T_RPAREN } } };
-    const r11 = Production{ .lhs = .{ .variable = V_PROP }, .rhs = &[_]Symbol{.{ .terminal = T_PROPTOK }} };
+    const r0 = Production{ .lhs = .{ .variable_id = V_S }, .rhs = &[_]SymbolId{.{ .variable_id = V_WFF1 }} };
+    const r1 = Production{ .lhs = .{ .variable_id = V_WFF1 }, .rhs = &[_]SymbolId{.{ .variable_id = V_WFF2 }} };
+    const r2 = Production{ .lhs = .{ .variable_id = V_WFF1 }, .rhs = &[_]SymbolId{ .{ .variable_id = V_WFF1 }, .{ .terminal_id = T_BICOND }, .{ .variable_id = V_WFF2 } } };
+    const r3 = Production{ .lhs = .{ .variable_id = V_WFF2 }, .rhs = &[_]SymbolId{.{ .variable_id = V_WFF3 }} };
+    const r4 = Production{ .lhs = .{ .variable_id = V_WFF2 }, .rhs = &[_]SymbolId{ .{ .variable_id = V_WFF2 }, .{ .terminal_id = T_COND }, .{ .variable_id = V_WFF3 } } };
+    const r5 = Production{ .lhs = .{ .variable_id = V_WFF3 }, .rhs = &[_]SymbolId{.{ .variable_id = V_WFF4 }} };
+    const r6 = Production{ .lhs = .{ .variable_id = V_WFF3 }, .rhs = &[_]SymbolId{ .{ .variable_id = V_WFF3 }, .{ .terminal_id = T_OR }, .{ .variable_id = V_WFF4 } } };
+    const r7 = Production{ .lhs = .{ .variable_id = V_WFF3 }, .rhs = &[_]SymbolId{ .{ .variable_id = V_WFF3 }, .{ .terminal_id = T_AND }, .{ .variable_id = V_WFF4 } } };
+    const r8 = Production{ .lhs = .{ .variable_id = V_WFF4 }, .rhs = &[_]SymbolId{.{ .variable_id = V_PROP }} };
+    const r9 = Production{ .lhs = .{ .variable_id = V_WFF4 }, .rhs = &[_]SymbolId{ .{ .terminal_id = T_NOT }, .{ .variable_id = V_WFF4 } } };
+    const r10 = Production{ .lhs = .{ .variable_id = V_PROP }, .rhs = &[_]SymbolId{ .{ .terminal_id = T_LPAREN }, .{ .variable_id = V_WFF1 }, .{ .terminal_id = T_RPAREN } } };
+    const r11 = Production{ .lhs = .{ .variable_id = V_PROP }, .rhs = &[_]SymbolId{.{ .terminal_id = T_PROPTOK }} };
 
     var expected_grammar = G{
         .allocator = null,
@@ -802,46 +766,30 @@ test "firsts_and_follows [grammar1.0]" {
     var allocator = std.testing.allocator;
 
     const first_set = try grammar.getFirstSet(allocator);
-    defer {
-        for (0..first_set.len) |i| {
-            allocator.free(first_set[i]);
-        }
-        allocator.free(first_set);
-    }
+    defer allocator.free(first_set);
 
     const first_set_comptime = comptime grammar.getFirstSetComptime();
 
-    const expected_firsts = [_][9]bool{
-        .{ true, true, true, false, false, false, false, false, false },
-        .{ true, true, true, false, false, false, false, false, false },
+    const expected_firsts = [_]bool{
+        true, true, true, false, false, false, false, false, false,
+        true, true, true, false, false, false, false, false, false,
     };
-    for (first_set, expected_firsts) |actual, expected| {
-        try std.testing.expectEqualSlices(bool, &expected, actual);
-    }
-    for (first_set_comptime, expected_firsts) |actual, expected| {
-        try std.testing.expectEqualSlices(bool, &expected, actual);
-    }
 
-    const follow = try grammar.getFollowSet(allocator);
-    defer {
-        for (0..follow.len) |i| {
-            allocator.free(follow[i]);
-        }
-        allocator.free(follow);
-    }
+    try std.testing.expectEqualSlices(bool, &expected_firsts, first_set);
+    try std.testing.expectEqualSlices(bool, &expected_firsts, &first_set_comptime);
 
-    const follow_comptime = comptime grammar.getFollowSetComptime();
+    const follow_set = try grammar.getFollowSet(allocator);
+    defer allocator.free(follow_set);
 
-    const expected_follow = [_][9]bool{
-        .{ false, false, false, false, false, false, false, false, true },
-        .{ false, false, false, true, true, true, true, true, true },
+    const follow_set_comptime = comptime grammar.getFollowSetComptime();
+
+    const expected_follow = [_]bool{
+        false, false, false, false, false, false, false, false, true,
+        false, false, false, true,  true,  true,  true,  true,  true,
     };
-    for (follow, expected_follow) |actual, expected| {
-        try std.testing.expectEqualSlices(bool, &expected, actual);
-    }
-    for (follow_comptime, expected_follow) |actual, expected| {
-        try std.testing.expectEqualSlices(bool, &expected, actual);
-    }
+
+    try std.testing.expectEqualSlices(bool, &expected_follow, follow_set);
+    try std.testing.expectEqualSlices(bool, &expected_follow, &follow_set_comptime);
 
     // debug.print("\n", .{});
     // for (follow, 0..) |list, i| {
@@ -901,53 +849,37 @@ test "firsts_and_follows [grammar2.2]" {
     var allocator = std.testing.allocator;
 
     const first_set = try grammar.getFirstSet(allocator);
-    defer {
-        for (0..first_set.len) |i| {
-            allocator.free(first_set[i]);
-        }
-        allocator.free(first_set);
-    }
+    defer allocator.free(first_set);
 
     const first_set_comptime = comptime grammar.getFirstSetComptime();
 
-    const expected_firsts = [_][9]bool{
-        .{ false, false, false, false, true, true, false, true, false },
-        .{ false, false, false, false, true, true, false, true, false },
-        .{ false, false, false, false, true, true, false, true, false },
-        .{ false, false, false, false, true, true, false, true, false },
-        .{ false, false, false, false, true, true, false, true, false },
-        .{ false, false, false, false, false, true, false, true, false },
+    const expected_firsts = [_]bool{
+        false, false, false, false, true,  true, false, true, false,
+        false, false, false, false, true,  true, false, true, false,
+        false, false, false, false, true,  true, false, true, false,
+        false, false, false, false, true,  true, false, true, false,
+        false, false, false, false, true,  true, false, true, false,
+        false, false, false, false, false, true, false, true, false,
     };
-    for (first_set, expected_firsts) |actual, expected| {
-        try std.testing.expectEqualSlices(bool, &expected, actual);
-    }
-    for (first_set_comptime, expected_firsts) |actual, expected| {
-        try std.testing.expectEqualSlices(bool, &expected, actual);
-    }
+    try std.testing.expectEqualSlices(bool, &expected_firsts, first_set);
+    try std.testing.expectEqualSlices(bool, &expected_firsts, &first_set_comptime);
 
-    const follow = try grammar.getFollowSet(allocator);
-    defer {
-        for (0..follow.len) |i| {
-            allocator.free(follow[i]);
-        }
-        allocator.free(follow);
-    }
-    const follow_comptime = comptime grammar.getFollowSetComptime();
 
-    const expected_follow = [_][9]bool{
-        .{ false, false, false, false, false, false, false, false, true },
-        .{ true, false, false, false, false, false, true, false, true },
-        .{ true, true, false, false, false, false, true, false, true },
-        .{ true, true, true, true, false, false, true, false, true },
-        .{ true, true, true, true, false, false, true, false, true },
-        .{ true, true, true, true, false, false, true, false, true },
+    const follow_set = try grammar.getFollowSet(allocator);
+    defer allocator.free(follow_set);
+
+    const follow_set_comptime = comptime grammar.getFollowSetComptime();
+
+    const expected_follow = [_]bool{
+        false, false, false, false, false, false, false, false, true,
+        true,  false, false, false, false, false, true,  false, true,
+        true,  true,  false, false, false, false, true,  false, true,
+        true,  true,  true,  true,  false, false, true,  false, true,
+        true,  true,  true,  true,  false, false, true,  false, true,
+        true,  true,  true,  true,  false, false, true,  false, true,
     };
-    for (follow, expected_follow) |actual, expected| {
-        try std.testing.expectEqualSlices(bool, &expected, actual);
-    }
-    for (follow_comptime, expected_follow) |actual, expected| {
-        try std.testing.expectEqualSlices(bool, &expected, actual);
-    }
+    try std.testing.expectEqualSlices(bool, &expected_follow, follow_set);
+    try std.testing.expectEqualSlices(bool, &expected_follow, &follow_set_comptime);
 
     // debug.print("\n", .{});
     // for (follow, 0..) |list, i| {
@@ -959,6 +891,124 @@ test "firsts_and_follows [grammar2.2]" {
     //     }
     //     debug.print("\n", .{});
     // }
+}
+
+fn tableFromTuples(
+    comptime tuples: anytype,
+    comptime Variable: type,
+    comptime Terminal: type,
+    grammar: Grammar(Variable, Terminal),
+) [grammar.getVariableCount() * grammar.getTerminalCount()]bool {
+    comptime {
+        var first_set = [_]bool {false} ** (grammar.getVariableCount() * grammar.getTerminalCount());
+        var first_set_2d_view = utils.Slice2d([]bool).init(&first_set, grammar.getTerminalCount());
+
+        for (tuples) |tuple| {
+            const variable = tuple.@"0";
+            const v_id = grammar.getSymbolIdFromVariable(variable).?.variable_id;
+
+            const terminals = tuple.@"1";
+            for (std.meta.fieldNames(@TypeOf(terminals))) |rhs_tuple_field_name| {
+                const terminal = @field(terminals, rhs_tuple_field_name);
+                if (@TypeOf(terminal) != Terminal) {
+                    @compileError("rhs of tuple must only contain Terminals");
+                }
+
+                const t_id = grammar.getSymbolIdFromTerminal(terminal).?.terminal_id;
+
+                first_set_2d_view.row(v_id)[t_id] = true;
+            }
+        }
+        return first_set;
+    }
+}
+
+test "first_and_follows [custom1]" {
+    const V = TestVariable.fromString;
+    const T = CustomTestTerminal.fromString;
+    const G = Grammar(TestVariable, CustomTestTerminal);
+
+    const grammar = comptime G.initFromTuples(
+        .{
+            .{ V("B"), .{ T("#") } },
+            .{ V("B"), .{ T("("), V("A"), T(")") } },
+            .{ V("A"), .{ V("B") } },
+            .{ V("A"), .{ T("~"), V("A") } },
+            .{ V("S"), .{ V("A") } },
+        },
+        V("S"),
+        T("$"),
+    );
+    defer grammar.deinit();
+
+    var allocator = std.testing.allocator;
+
+    const first_set = try grammar.getFirstSet(allocator);
+    defer allocator.free(first_set);
+
+    const first_set_comptime = comptime grammar.getFirstSetComptime();
+
+    const expected_first_set = comptime tableFromTuples(
+        .{
+            .{ V("S"), .{ T("("), T("#"), T("~") } },
+            .{ V("A"), .{ T("("), T("#"), T("~") } },
+            .{ V("B"), .{ T("("), T("#") } },
+        },
+        TestVariable,
+        CustomTestTerminal,
+        grammar
+    );
+
+    try std.testing.expectEqualSlices(bool, &expected_first_set, first_set);
+    try std.testing.expectEqualSlices(bool, &expected_first_set, &first_set_comptime);
+}
+
+test "first_and_follows [custom2]" {
+    const V = TestVariable.fromString;
+    const T = CustomTestTerminal.fromString;
+    const G = Grammar(TestVariable, CustomTestTerminal);
+
+    const grammar = comptime G.initFromTuples(
+        .{
+            .{ V("S"), .{ V("A") } },
+
+            .{ V("A"), .{ T("c"), V("B") } },
+            .{ V("A"), .{ T("a") } },
+
+            .{ V("B"), .{ V("C"), T("b") } },
+
+            .{ V("C"), .{ V("D") } },
+            .{ V("C"), .{ V("A"), T("d") } },
+
+            .{ V("D"), .{ T("q") } },
+        },
+        V("S"),
+        T("$"),
+    );
+    defer grammar.deinit();
+
+    var allocator = std.testing.allocator;
+
+    const first_set = try grammar.getFirstSet(allocator);
+    defer allocator.free(first_set);
+
+    const first_set_comptime = comptime grammar.getFirstSetComptime();
+
+    const expected_first_set = comptime tableFromTuples(
+        .{
+            .{ V("S"), .{ T("c"), T("a") } },
+            .{ V("A"), .{ T("c"), T("a") } },
+            .{ V("B"), .{ T("c"), T("a"), T("q") } },
+            .{ V("C"), .{ T("c"), T("a"), T("q") } },
+            .{ V("D"), .{ T("q") } },
+        },
+        TestVariable,
+        CustomTestTerminal,
+        grammar
+    );
+
+    try std.testing.expectEqualSlices(bool, &expected_first_set, first_set);
+    try std.testing.expectEqualSlices(bool, &expected_first_set, &first_set_comptime);
 }
 
 pub fn ParseTable(comptime Variable: type, comptime Terminal: type) type {
@@ -1023,20 +1073,20 @@ pub fn ParseTable(comptime Variable: type, comptime Terminal: type) type {
         //     return self.action_table[state][terminal_idx];
         // }
 
-        pub fn lookupSymbol(self: Self, state: StateIdx, symbol: Symbol) Action {
-            return switch(symbol) {
-                .terminal => |t_idx| self.action_table[state][t_idx],
-                .variable => |v_idx| self.goto_table[state][v_idx]
+        pub fn lookupSymbol(self: Self, state: StateIdx, symbol: SymbolId) Action {
+            return switch (symbol) {
+                .terminal_id => |t_id| self.action_table[state][t_id],
+                .variable_id => |v_id| self.goto_table[state][v_id],
             };
         }
 
         pub fn lookupVariable(self: Self, state: StateIdx, variable: Variable) ?Action {
-            const symbol = self.grammar.getSymbolFromVariable(variable) orelse return null;
+            const symbol = self.grammar.getSymbolIdFromVariable(variable) orelse return null;
             return self.lookupSymbol(state, symbol);
         }
 
         pub fn lookupTerminal(self: Self, state: StateIdx, terminal: Terminal) ?Action {
-            const symbol = self.grammar.getSymbolFromTerminal(terminal) orelse return null;
+            const symbol = self.grammar.getSymbolIdFromTerminal(terminal) orelse return null;
             return self.lookupSymbol(state, symbol);
         }
 
@@ -1110,11 +1160,11 @@ pub fn ParseTable(comptime Variable: type, comptime Terminal: type) type {
             while (stack.pop()) |prod| {
                 if (prod.readCursor()) |sym| {
                     switch (sym) {
-                        .variable => |idx| {
+                        .variable_id => |id| {
                             // If the variable has not been encountered yet,
                             // expand it by pushing any productions from it onto
                             // the stack.
-                            if (variable_branches[idx].items.len == 0) {
+                            if (variable_branches[id].items.len == 0) {
                                 for (grammar.rules) |rule| {
                                     if (sym.eql(rule.lhs)) {
                                         try stack.append(ProductionInstance.fromProduction(rule));
@@ -1122,9 +1172,9 @@ pub fn ParseTable(comptime Variable: type, comptime Terminal: type) type {
                                 }
                             }
                             // Add the variable as a branch.
-                            try variable_branches[idx].append(prod.copyAdvanceCursor());
+                            try variable_branches[id].append(prod.copyAdvanceCursor());
                         },
-                        .terminal => |idx| try terminal_branches[idx].append(prod.copyAdvanceCursor()),
+                        .terminal_id => |id| try terminal_branches[id].append(prod.copyAdvanceCursor()),
                     }
                 }
             }
@@ -1155,11 +1205,11 @@ pub fn ParseTable(comptime Variable: type, comptime Terminal: type) type {
 
                 if (prod.readCursor()) |sym| {
                     switch (sym) {
-                        .variable => |idx| {
+                        .variable_id => |id| {
                             // If the variable has not been encountered yet,
                             // expand it by pushing any productions from it onto
                             // the stack.
-                            if (variable_branches[idx].len == 0) {
+                            if (variable_branches[id].len == 0) {
                                 for (grammar.rules) |rule| {
                                     if (sym.eql(rule.lhs)) {
                                         stack = stack ++ &[_]ProductionInstance {ProductionInstance.fromProduction(rule)};
@@ -1169,9 +1219,9 @@ pub fn ParseTable(comptime Variable: type, comptime Terminal: type) type {
                             // Add the variable as a branch.
                             // const new = variable_branches[idx] ++ &[_]ProductionInstance {prod.copyAdvanceCursor()};
                             // variable_branches = variable_branches[0..idx] ++ &[_][]const ProductionInstance {new} ++ variable_branches[(idx + 1)..variable_branches.len];
-                            variable_branches[idx] = variable_branches[idx] ++ &[_]ProductionInstance {prod.copyAdvanceCursor()};
+                            variable_branches[id] = variable_branches[id] ++ &[_]ProductionInstance {prod.copyAdvanceCursor()};
                         },
-                        .terminal => |idx| terminal_branches[idx] = terminal_branches[idx] ++ &[_]ProductionInstance {prod.copyAdvanceCursor()},
+                        .terminal_id => |id| terminal_branches[id] = terminal_branches[id] ++ &[_]ProductionInstance {prod.copyAdvanceCursor()},
                     }
                 }
             }
@@ -1217,7 +1267,7 @@ pub fn ParseTable(comptime Variable: type, comptime Terminal: type) type {
             try goto_table.append(try allocator.alloc(Action, grammar.getVariableCount()));
             try action_table.append(try allocator.alloc(Action, grammar.getTerminalCount()));
             try primary_productions_table.append(try allocator.alloc(ProductionInstance, 1));
-            primary_productions_table.items[0][0] = ProductionInstance.fromProduction(grammar.rules[grammar.getStartRuleIdx()]);
+            primary_productions_table.items[0][0] = ProductionInstance.fromProduction(grammar.rules[grammar.getStartRuleId()]);
 
             var state: usize = 0;
             while (state < goto_table.items.len) : (state += 1) {
@@ -1233,15 +1283,15 @@ pub fn ParseTable(comptime Variable: type, comptime Terminal: type) type {
                     allocator.free(terminal_branches);
                 }
 
-                for (variable_branches, 0..) |*prod_list, v_idx| {
+                for (variable_branches, 0..) |*prod_list, v_id| {
                     // If there are no transitions from this variable, mark
                     // this cell as invalid.
                     if (prod_list.items.len == 0) {
-                        goto_table.items[state][v_idx] = Action.invalid;
+                        goto_table.items[state][v_id] = Action.invalid;
                         // If expanding these productions would result in a state
                         // that already exists,
                     } else if (checkStateAlreadyExists(primary_productions_table.items, prod_list.items)) |existing_state| {
-                        goto_table.items[state][v_idx] = try switch (goto_table.items[state][v_idx]) {
+                        goto_table.items[state][v_id] = try switch (goto_table.items[state][v_id]) {
                             .invalid => Action{ .state = existing_state },
                             .state => TableGeneratorError.shiftShiftError,
                             .reduce => TableGeneratorError.shiftReduceError,
@@ -1251,18 +1301,18 @@ pub fn ParseTable(comptime Variable: type, comptime Terminal: type) type {
                         try goto_table.append(try allocator.alloc(Action, grammar.getVariableCount()));
                         try action_table.append(try allocator.alloc(Action, grammar.getTerminalCount()));
                         try primary_productions_table.append(try prod_list.toOwnedSlice());
-                        goto_table.items[state][v_idx] = Action{ .state = goto_table.items.len - 1 };
+                        goto_table.items[state][v_id] = Action{ .state = goto_table.items.len - 1 };
                     }
                 }
-                for (terminal_branches, 0..) |*prod_list, t_idx| {
+                for (terminal_branches, 0..) |*prod_list, t_id| {
                     // If there are no transitions from this variable, mark
                     // this cell as invalid.
                     if (prod_list.items.len == 0) {
-                        action_table.items[state][t_idx] = Action.invalid;
+                        action_table.items[state][t_id] = Action.invalid;
                     // If expanding these productions would result in a state
                     // that already exists,
                     } else if (checkStateAlreadyExists(primary_productions_table.items, prod_list.items)) |existing_state| {
-                        action_table.items[state][t_idx] = try switch (action_table.items[state][t_idx]) {
+                        action_table.items[state][t_id] = try switch (action_table.items[state][t_id]) {
                             .invalid => Action{ .state = existing_state },
                             .state => TableGeneratorError.shiftShiftError,
                             .reduce => TableGeneratorError.shiftReduceError,
@@ -1272,16 +1322,13 @@ pub fn ParseTable(comptime Variable: type, comptime Terminal: type) type {
                         try goto_table.append(try allocator.alloc(Action, grammar.getVariableCount()));
                         try action_table.append(try allocator.alloc(Action, grammar.getTerminalCount()));
                         try primary_productions_table.append(try prod_list.toOwnedSlice());
-                        action_table.items[state][t_idx] = Action{ .state = action_table.items.len - 1 };
+                        action_table.items[state][t_id] = Action{ .state = action_table.items.len - 1 };
                     }
                 }
             }
 
             const follow_set = try grammar.getFollowSet(allocator);
-            defer {
-                for (follow_set) |row| allocator.free(row);
-                allocator.free(follow_set);
-            }
+            defer allocator.free(follow_set);
 
             // Populate reductions
             // For each completed primary production in each state, identify the
@@ -1291,12 +1338,12 @@ pub fn ParseTable(comptime Variable: type, comptime Terminal: type) type {
                 for (row) |instance| {
                     if (instance.readCursor() != null) continue;
 
-                    const rule_idx = grammar.getRuleIdx(instance.production).?;
-                    for (follow_set[instance.production.lhs.variable], 0..) |isFollow, t_idx| {
-                        if (!isFollow) continue;
+                    const rule_id = grammar.getRuleId(instance.production).?;
+                    for (0..grammar.getTerminalCount()) |t_id| {
+                        if (!follow_set[instance.production.lhs.variable_id * grammar.getTerminalCount() + t_id]) continue;
 
-                        action_table.items[state_num][t_idx] = try switch (action_table.items[state_num][t_idx]) {
-                            .invalid => Action{ .reduce = rule_idx },
+                        action_table.items[state_num][t_id] = try switch (action_table.items[state_num][t_id]) {
+                            .invalid => Action{ .reduce = rule_id },
                             .state => TableGeneratorError.shiftReduceError,
                             .reduce => TableGeneratorError.reduceReduceError,
                             .accept => TableGeneratorError.reduceAcceptError,
@@ -1304,13 +1351,13 @@ pub fn ParseTable(comptime Variable: type, comptime Terminal: type) type {
                     }
 
                     // TODO: hardcoded 0 kinda yucky
-                    if (instance.production.lhs.variable == grammar.getStartSymbol().variable) {
-                        switch (action_table.items[state_num][grammar.getEndSymbol().terminal]) {
+                    if (instance.production.lhs.variable_id == grammar.getStartSymbolId().variable_id) {
+                        switch (action_table.items[state_num][grammar.getEndSymbolId().terminal_id]) {
                             .invalid => return TableGeneratorError.acceptError,
                             .state => return TableGeneratorError.shiftAcceptError,
-                            .reduce => |reduction_rule_idx| {
-                                if (reduction_rule_idx == grammar.getStartRuleIdx()) {
-                                    action_table.items[state_num][grammar.getEndSymbol().terminal] = Action.accept;
+                            .reduce => |reduction_rule_id| {
+                                if (reduction_rule_id == grammar.getStartRuleId()) {
+                                    action_table.items[state_num][grammar.getEndSymbolId().terminal_id] = Action.accept;
                                 } else {
                                     return TableGeneratorError.acceptError;
                                 }
@@ -1334,14 +1381,14 @@ pub fn ParseTable(comptime Variable: type, comptime Terminal: type) type {
                 };
 
                 var primary_productions_table: []const []const ProductionInstance = &[_][]const ProductionInstance {
-                    &[_]ProductionInstance {ProductionInstance.fromProduction(grammar.rules[grammar.getStartRuleIdx()])},
+                    &[_]ProductionInstance{ProductionInstance.fromProduction(grammar.rules[grammar.getStartRuleId()])},
                 };
 
                 var state_num: usize = 0;
                 while (state_num < goto_table.len) : (state_num += 1) {
                     const variable_branches, const terminal_branches = try expandProductionsComptime(grammar, primary_productions_table[state_num]);
 
-                    for (variable_branches, 0..) |prod_list, v_idx| {
+                    for (variable_branches, 0..) |prod_list, v_id| {
                         // If there are no transitions from this variable, move on
                         // (cell is initialized to invalid so we don't need to set
                         // it here)
@@ -1352,7 +1399,7 @@ pub fn ParseTable(comptime Variable: type, comptime Terminal: type) type {
                         // If expanding these productions would result in a state
                         // that already exists,
                         else if (checkStateAlreadyExists(primary_productions_table, prod_list)) |existing_state| {
-                            const new_action = switch (goto_table[state_num][v_idx]) {
+                            const new_action = switch (goto_table[state_num][v_id]) {
                                 .invalid => Action{ .state = existing_state },
                                 .state => @compileError("Parsing error: shift shift conflict"),
                                 .reduce => @compileError("Parsing error: shift reduce conflict"),
@@ -1365,19 +1412,19 @@ pub fn ParseTable(comptime Variable: type, comptime Terminal: type) type {
                             // to be assigned replaced with the desired new
                             // entry. Probably very inefficient but it's
                             // comptime so who cares.
-                            const new_row = goto_table[state_num][0..v_idx] ++ [_]Action { new_action } ++ goto_table[state_num][(v_idx + 1)..goto_table[state_num].len];
+                            const new_row = goto_table[state_num][0..v_id] ++ [_]Action { new_action } ++ goto_table[state_num][(v_id + 1)..goto_table[state_num].len];
                             goto_table = goto_table[0..state_num] ++ [_][]const Action {new_row} ++ goto_table[(state_num + 1)..goto_table.len];
                         } else {
                             goto_table = goto_table ++ [_][]const Action{ &[_]Action {Action{.invalid = {}}} ** grammar.getVariableCount() };
                             action_table = action_table ++ [_][]const Action{ &[_]Action {Action{.invalid = {}}} ** grammar.getTerminalCount() };
                             primary_productions_table = primary_productions_table ++ [_][]const ProductionInstance{ prod_list };
 
-                            const new_row = goto_table[state_num][0..v_idx] ++ [_]Action {Action {.state = goto_table.len - 1 } } ++ goto_table[state_num][(v_idx + 1)..goto_table[state_num].len];
+                            const new_row = goto_table[state_num][0..v_id] ++ [_]Action {Action {.state = goto_table.len - 1 } } ++ goto_table[state_num][(v_id + 1)..goto_table[state_num].len];
                             goto_table = goto_table[0..state_num] ++ [_][]const Action {new_row} ++ goto_table[(state_num + 1)..goto_table.len];
                         }
                     }
                     // @compileLog(goto_table);
-                    for (terminal_branches, 0..) |prod_list, t_idx| {
+                    for (terminal_branches, 0..) |prod_list, t_id| {
                         // If there are no transitions from this variable, move on
                         // (cell is initialized to invalid so we don't need to set
                         // it here)
@@ -1388,20 +1435,20 @@ pub fn ParseTable(comptime Variable: type, comptime Terminal: type) type {
                         // If expanding these productions would result in a state
                         // that already exists,
                         if (checkStateAlreadyExists(primary_productions_table, prod_list)) |existing_state| {
-                            const new_action = switch (action_table[state_num][t_idx]) {
+                            const new_action = switch (action_table[state_num][t_id]) {
                                 .invalid => Action{ .state = existing_state },
                                 .state => @compileError("Parsing error: shift shift conflict"),
                                 .reduce => @compileError("Parsing error: shift reduce conflict"),
                                 .accept => @compileError("Parsing error: shift accept error"),
                             };
-                            const new_row = action_table[state_num][0..t_idx] ++ [_]Action { new_action } ++ action_table[state_num][(t_idx + 1)..action_table[state_num].len];
+                            const new_row = action_table[state_num][0..t_id] ++ [_]Action { new_action } ++ action_table[state_num][(t_id + 1)..action_table[state_num].len];
                             action_table = action_table[0..state_num] ++ [_][]const Action {new_row} ++ action_table[(state_num + 1)..action_table.len];
                         } else {
                             goto_table = goto_table ++ [_][]const Action{ &[_]Action {Action{.invalid = {}}} ** grammar.getVariableCount() };
                             action_table = action_table ++ [_][]const Action{ &[_]Action {Action{.invalid = {}}} ** grammar.getTerminalCount() };
                             primary_productions_table = primary_productions_table ++ [_][]const ProductionInstance{ prod_list };
 
-                            const new_row = action_table[state_num][0..t_idx] ++ [_]Action {Action {.state = action_table.len - 1 } } ++ action_table[state_num][(t_idx + 1)..action_table[state_num].len];
+                            const new_row = action_table[state_num][0..t_id] ++ [_]Action {Action {.state = action_table.len - 1 } } ++ action_table[state_num][(t_id + 1)..action_table[state_num].len];
                             action_table = action_table[0..state_num] ++ [_][]const Action {new_row} ++ action_table[(state_num + 1)..action_table.len];
                         }
                     }
@@ -1418,29 +1465,29 @@ pub fn ParseTable(comptime Variable: type, comptime Terminal: type) type {
                     for (row) |instance| {
                         if (instance.readCursor() != null) continue;
 
-                        const rule_idx = grammar.getRuleIdx(instance.production).?;
-                        for (follow_set[instance.production.lhs.variable], 0..) |isFollow, t_idx| {
-                            if (!isFollow) continue;
+                        const rule_id = grammar.getRuleId(instance.production).?;
+                        for (0..grammar.getTerminalCount()) |t_id| {
+                            if (!follow_set[instance.production.lhs.variable_id * grammar.getTerminalCount() + t_id]) continue;
 
-                            const new_action = switch (action_table[state_num_][t_idx]) {
-                                .invalid => Action{ .reduce = rule_idx },
+                            const new_action = switch (action_table[state_num_][t_id]) {
+                                .invalid => Action{ .reduce = rule_id },
                                 .state => @compileError("Parsing error: shift reduce error"),
                                 .reduce => @compileError("Parsing error: reduce reduce error"),
                                 .accept => @compileError("Parsing error: reduce accept error"),
                             };
-                            const new_row = action_table[state_num_][0..t_idx] ++ [_]Action { new_action } ++ action_table[state_num_][(t_idx + 1)..action_table[state_num_].len];
+                            const new_row = action_table[state_num_][0..t_id] ++ [_]Action { new_action } ++ action_table[state_num_][(t_id + 1)..action_table[state_num_].len];
                             action_table = action_table[0..state_num_] ++ [_][]const Action {new_row} ++ action_table[(state_num_ + 1)..action_table.len];
                         }
 
                         // TODO: hardcoded 0 kinda yucky
-                        if (instance.production.lhs.variable == grammar.getStartSymbol().variable) {
-                            switch (action_table[state_num_][grammar.getEndSymbol().terminal]) {
+                        if (instance.production.lhs.variable_id == grammar.getStartSymbolId().variable_id) {
+                            switch (action_table[state_num_][grammar.getEndSymbolId().terminal_id]) {
                                 .invalid => @compileError("Parsing error: missing accepting reduction"),
                                 .state => @compileError("Parsing error: shift accept error"),
-                                .reduce => |reduction_rule_idx| {
-                                    if (reduction_rule_idx == grammar.getStartRuleIdx()) {
-                                        const t_idx = grammar.getEndSymbol().terminal;
-                                        const new_row = action_table[state_num_][0..t_idx] ++ [_]Action { Action {.accept = {}} } ++ action_table[state_num_][(t_idx + 1)..action_table[state_num_].len];
+                                .reduce => |reduction_rule_id| {
+                                    if (reduction_rule_id == grammar.getStartRuleId()) {
+                                        const t_id = grammar.getEndSymbolId().terminal_id;
+                                        const new_row = action_table[state_num_][0..t_id] ++ [_]Action { Action {.accept = {}} } ++ action_table[state_num_][(t_id + 1)..action_table[state_num_].len];
                                         action_table = action_table[0..state_num_] ++ [_][]const Action {new_row} ++ action_table[(state_num_ + 1)..action_table.len];
                                     } else {
                                         @compileError("Parsing error: the accepting state can only replace the starting production rule, found a different rule instead");
