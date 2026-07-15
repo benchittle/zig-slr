@@ -48,6 +48,15 @@ pub const Production = struct {
 // NOTE: comparison of symbols is not always done using .eql in below functions, should try to make this consistent
 // NOTE: FOLLOW and FIRST sets generation code is way too nested, should ideally
 //       be broken down into smaller functions
+
+/// Representation of a formal grammar for a language.
+///
+/// * `Variable` is the type that will be used to specify grammar variables /
+///   non-terminals.
+/// * `Terminal` is the type that will be used to specify grammar terminals.
+///
+/// Both types must define an equality function of the form
+/// `pub fn eql(@This(), @This()) bool`
 pub fn Grammar(comptime Variable: type, comptime Terminal: type) type {
     return struct {
         const Self = @This();
@@ -57,7 +66,17 @@ pub fn Grammar(comptime Variable: type, comptime Terminal: type) type {
         variables: []const Variable,
         terminals: []const Terminal,
 
-        pub fn initFromTuples(comptime rule_tuples: anytype, comptime start_variable: Variable, comptime end_terminal: Terminal) Self {
+        /// Initialize a formal grammar at comptime using tuples.
+        /// * `rule_tuples` is a nested tuple containing the productions of the
+        ///   grammar. See the tests in this file for usage examples.
+        /// * `start_variable` is the start variable of the grammar.
+        /// * `end_terminal` is the terminal that will be used to mark the
+        ///   end of a string during parsing.
+        pub fn initFromTuples(
+            comptime rule_tuples: anytype,
+            comptime start_variable: Variable,
+            comptime end_terminal: Terminal
+        ) Self {
             comptime {
                 // Initialize a grammar struct to populate.
                 var grammar = Self{
@@ -235,13 +254,12 @@ pub fn Grammar(comptime Variable: type, comptime Terminal: type) type {
             return null;
         }
 
-        /// Returns variable with index 0.
         pub fn getStartSymbolId(_: Self) SymbolId {
             return SymbolId{ .variable_id = 0 };
         }
 
         pub fn getEndSymbolId(self: Self) SymbolId {
-            return SymbolId{ .terminal_id = @intCast(self.getTerminalCount() - 1) };
+            return SymbolId{ .terminal_id = self.getTerminalCount() - 1 };
         }
 
         pub fn getStartRuleId(_: Self) usize {
@@ -659,7 +677,7 @@ test "Grammar.initFromTuples [grammar1.0]" {
     // R4: wff -> LParen wff Or     wff RParen
     // R5: wff -> LParen wff Cond   wff RParen
     // R6: wff -> LParen wff Bicond wff RParen
-    //
+
     const V_S = 0;
     const V_WFF = 1;
     const T_PROPOSITION = 0;
@@ -842,17 +860,6 @@ test "firsts_and_follows [grammar1.0]" {
 
     try std.testing.expectEqualSlices(bool, &expected_follow, follow_set);
     try std.testing.expectEqualSlices(bool, &expected_follow, &follow_set_comptime);
-
-    // debug.print("\n", .{});
-    // for (follow, 0..) |list, i| {
-    //     debug.print("({d}):", .{i});
-    //     for (list, grammar.variables.len..) |isFollow, j| {
-    //         if (isFollow) {
-    //             debug.print(" {d}", .{j});
-    //         }
-    //     }
-    //     debug.print("\n", .{});
-    // }
 }
 
 test "firsts_and_follows [grammar2.2]" {
@@ -934,17 +941,6 @@ test "firsts_and_follows [grammar2.2]" {
     };
     try std.testing.expectEqualSlices(bool, &expected_follow, follow_set);
     try std.testing.expectEqualSlices(bool, &expected_follow, &follow_set_comptime);
-
-    // debug.print("\n", .{});
-    // for (follow, 0..) |list, i| {
-    //     debug.print("({d}):", .{i});
-    //     for (list, grammar.variables.len..) |isFollow, j| {
-    //         if (isFollow) {
-    //             debug.print(" {d}", .{j});
-    //         }
-    //     }
-    //     debug.print("\n", .{});
-    // }
 }
 
 fn tableFromTuples(
