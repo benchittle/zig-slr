@@ -1,3 +1,4 @@
+const std = @import("std");
 
 pub fn Slice2d(comptime SliceType: type) type {
     comptime {
@@ -26,4 +27,33 @@ pub fn Slice2d(comptime SliceType: type) type {
             return self.slice[start..end];
         }
     };
+}
+
+pub fn GraphEdge(comptime T: type) type {
+    return struct { // TODO: consider packed struct
+        const Self = @This();
+
+        from: T,
+        to: T,
+
+        pub fn lessThan(_: void, lhs: Self, rhs: Self) bool {
+            return lhs.from < rhs.from;
+        }
+    };
+}
+
+/// Analogous to a bitwise or like `dest = dest | src` but for each boolean
+/// element in the given slices
+pub fn sliceUnion(dest: []bool, src: []const bool) void {
+    std.debug.assert(dest.len == src.len);
+    for (src, 0..) |element, i| {
+        if (element) {
+            dest[i] = true;
+        }
+    }
+}
+
+/// See `sliceUnion`
+pub fn rowUnion(data: Slice2d([]bool), row_dest: usize, row_src: usize) void {
+    sliceUnion(data.row(row_dest), data.row(row_src));
 }
