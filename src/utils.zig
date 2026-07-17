@@ -26,15 +26,6 @@ pub fn Slice2d(comptime SliceType: type) type {
             const end = start + self.row_length;
             return self.slice[start..end];
         }
-    };
-}
-
-pub fn GraphEdge(comptime T: type) type {
-    return struct { // TODO: consider packed struct
-        const Self = @This();
-
-        from: T,
-        to: T,
 
         pub fn lessThan(_: void, lhs: Self, rhs: Self) bool {
             return lhs.from < rhs.from;
