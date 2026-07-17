@@ -23,6 +23,13 @@ pub const SymbolId = union(enum) {
             },
         };
     }
+
+    pub fn eqlVariable(self: Self, other: VariableId) bool {
+        return switch (self) {
+            .variable_id => |id| id == other,
+            .terminal_id => false,
+        };
+    }
 };
 
 pub const Production = struct {
@@ -30,11 +37,11 @@ pub const Production = struct {
     // allocated strings
     const Self = @This();
 
-    lhs: SymbolId,
+    lhs: SymbolId.VariableId,
     rhs: []const SymbolId,
 
     pub fn eql(self: Self, other: Self) bool {
-        if (!self.lhs.eql(other.lhs)) return false;
+        if (self.lhs != other.lhs) return false;
         if (self.rhs.len != other.rhs.len) return false;
         for (self.rhs, other.rhs) |sym1, sym2| {
             if (!sym1.eql(sym2)) return false;
@@ -50,12 +57,12 @@ pub const Production = struct {
     fn lessThan(_: void, this: Self, other: Self) bool {
         return switch(this.rhs[0]) {
             .variable_id => switch (other.rhs[0]) {
-                .variable_id => this.lhs.variable_id < other.lhs.variable_id,
+                .variable_id => this.lhs < other.lhs,
                 .terminal_id => true,
             },
             .terminal_id => switch(other.rhs[0]) {
                 .variable_id => false,
-                .terminal_id => this.lhs.variable_id < other.lhs.variable_id,
+                .terminal_id => this.lhs < other.lhs,
             }
         };
     }
@@ -130,11 +137,11 @@ pub fn Grammar(comptime Variable: type, comptime Terminal: type) type {
                     // checked that it is of type Variable.
                     const lhs = rule_tuple.@"0";
                     if (grammar.getSymbolIdFromVariable(lhs)) |id| {
-                        rule.lhs = id;
+                        rule.lhs = id.variable_id;
                     } else {
                         // If we haven't seen this variable yet, append it to
                         // the variables list.
-                        rule.lhs = SymbolId{ .variable_id = grammar.getVariableCount() };
+                        rule.lhs = grammar.getVariableCount();
                         grammar.variables = grammar.variables ++ &[_]Variable{lhs};
                     }
 
@@ -172,9 +179,9 @@ pub fn Grammar(comptime Variable: type, comptime Terminal: type) type {
                 // we have them.
                 var rules: [grammar.rules.len]Production = undefined;
                 std.mem.copyForwards(Production, &rules, grammar.rules);
-                std.mem.sortUnstable(Production, rules, {}, Production.lessThan);
+                std.mem.sortUnstable(Production, &rules, {}, Production.lessThan);
                 const sorted_rules = rules;
-                grammar.rules = sorted_rules;
+                grammar.rules = &sorted_rules;
 
                 return grammar;
             }
@@ -369,14 +376,14 @@ pub fn Grammar(comptime Variable: type, comptime Terminal: type) type {
 
             // Populate first_var_edge_list_offsets as described above.
             {
-                var current_key = self.rules[0].lhs.variable_id;
+                var current_key = self.rules[0].lhs;
                 var offset: usize = 0;
                 for (self.rules[0..total_edge_count], 0..) |rule, i| {
-                    if (current_key != rule.lhs.variable_id) {
+                    if (current_key != rule.lhs) {
                         offset = i;
-                        current_key = rule.lhs.variable_id;
+                        current_key = rule.lhs;
                     }
-                    first_var_edge_list_offsets[rule.lhs.variable_id] = offset;
+                    first_var_edge_list_offsets[rule.lhs] = offset;
                 }
             }
 
@@ -398,7 +405,7 @@ pub fn Grammar(comptime Variable: type, comptime Terminal: type) type {
                 for (1..first_var_edge_list_offsets.len) |i| {
                     const node_id = first_var_edge_list_offsets.len - i - 1;
                     const offset = first_var_edge_list_offsets[node_id];
-                    if (self.rules[offset].lhs.variable_id != node_id) {
+                    if (self.rules[offset].lhs != node_id) {
                         first_var_edge_list_offsets[node_id] = last_offset;
                     } else {
                         last_offset = offset;
@@ -412,7 +419,7 @@ pub fn Grammar(comptime Variable: type, comptime Terminal: type) type {
             // (Start iterating from total_edge_count to skip past all the rules
             // whose rhs starts with a variable)
             for (self.rules[total_edge_count..]) |rule| {
-                const var_id = rule.lhs.variable_id;
+                const var_id = rule.lhs;
                 const first_rule_symbol_id = rule.rhs[0].terminal_id;
                 first_set_table.row(var_id)[first_rule_symbol_id] = true;
             }
@@ -561,7 +568,7 @@ pub fn Grammar(comptime Variable: type, comptime Terminal: type) type {
             self: Self,
             follow_set: []bool,
             seen: []bool,
-            stack_buffer: []SymbolId,
+            stack_buffer: []SymbolId.VariableId,
             first_set: []const bool,
         ) void {
             std.debug.assert(follow_set.len >= self.getVariableCount() * self.getTerminalCount());
@@ -581,13 +588,13 @@ pub fn Grammar(comptime Variable: type, comptime Terminal: type) type {
                 @memset(seen, false);
                 seen[v_id] = true; // redundant?
 
-                var stack = std.ArrayListUnmanaged(SymbolId).initBuffer(stack_buffer);
-                stack.appendAssumeCapacity(SymbolId{ .variable_id = @intCast(v_id) });
+                var stack = std.ArrayListUnmanaged(SymbolId.VariableId).initBuffer(stack_buffer);
+                stack.appendAssumeCapacity(@intCast(v_id));
 
-                while (stack.pop()) |top_symbol| {
+                while (stack.pop()) |top_var_id| {
                     for (self.rules) |rule| {
                         for (rule.rhs[0 .. rule.rhs.len - 1], 0..) |rhs_symbol, i| {
-                            if (!rhs_symbol.eql(top_symbol)) {
+                            if (!rhs_symbol.eqlVariable(top_var_id)) {
                                 continue;
                             }
 
@@ -605,13 +612,13 @@ pub fn Grammar(comptime Variable: type, comptime Terminal: type) type {
                         // Handle the last RHS symbol separatly //
 
                         const last_rhs_symbol = rule.rhs[rule.rhs.len - 1];
-                        if (!last_rhs_symbol.eql(top_symbol) or seen[rule.lhs.variable_id]) {
+                        if (!last_rhs_symbol.eqlVariable(top_var_id) or seen[rule.lhs]) {
                             continue;
                         }
                         // Check if we already have the Follow set for this variable
                         // TODO: Make this more explicit?
-                        if (rule.lhs.variable_id < v_id) {
-                            for (follow_set_2d_view.row(rule.lhs.variable_id), 0..) |is_follow, terminal_id| {
+                        if (rule.lhs < v_id) {
+                            for (follow_set_2d_view.row(rule.lhs), 0..) |is_follow, terminal_id| {
                                 if (is_follow) {
                                     follow_set_2d_view.row(v_id)[terminal_id] = true;
                                 }
@@ -619,7 +626,7 @@ pub fn Grammar(comptime Variable: type, comptime Terminal: type) type {
                         } else {
                             stack.appendAssumeCapacity(rule.lhs);
                         }
-                        seen[rule.lhs.variable_id] = true;
+                        seen[rule.lhs] = true;
                     }
                 }
             }
@@ -661,7 +668,7 @@ pub fn Grammar(comptime Variable: type, comptime Terminal: type) type {
 
             const follow_set_buffer = try allocator.alloc(bool, self.getVariableCount() * self.getTerminalCount());
             errdefer allocator.free(follow_set_buffer);
-            const stack_buffer = try allocator.alloc(SymbolId, self.getVariableCount());
+            const stack_buffer = try allocator.alloc(SymbolId.VariableId, self.getVariableCount());
             defer allocator.free(stack_buffer);
 
             self.computeFollowSet(follow_set_buffer, visited_buffer, stack_buffer, first_set_buffer);
@@ -688,7 +695,7 @@ pub fn Grammar(comptime Variable: type, comptime Terminal: type) type {
                 );
 
                 var follow_set_buffer: [self.getVariableCount() * self.getTerminalCount()]bool = undefined;
-                var stack_buffer: [self.getVariableCount()]SymbolId = undefined;
+                var stack_buffer: [self.getVariableCount()]SymbolId.VariableId = undefined;
 
                 self.computeFollowSet(&follow_set_buffer, &visited_buffer, &stack_buffer, &first_set_buffer);
                 return follow_set_buffer;
@@ -737,13 +744,13 @@ test "Grammar.initFromTuples [grammar1.0]" {
         TestTerminal.End,
     );
 
-    const r0 = Production{ .lhs = .{ .variable_id = V_S }, .rhs = &[_]SymbolId{.{ .variable_id = V_WFF }} };
-    const r1 = Production{ .lhs = .{ .variable_id = V_WFF }, .rhs = &[_]SymbolId{.{ .terminal_id = T_PROPOSITION }} };
-    const r2 = Production{ .lhs = .{ .variable_id = V_WFF }, .rhs = &[_]SymbolId{ .{ .terminal_id = T_NOT }, .{ .variable_id = V_WFF } } };
-    const r3 = Production{ .lhs = .{ .variable_id = V_WFF }, .rhs = &[_]SymbolId{ .{ .terminal_id = T_LPAREN }, .{ .variable_id = V_WFF }, .{ .terminal_id = T_AND }, .{ .variable_id = V_WFF }, .{ .terminal_id = T_RPAREN } } };
-    const r4 = Production{ .lhs = .{ .variable_id = V_WFF }, .rhs = &[_]SymbolId{ .{ .terminal_id = T_LPAREN }, .{ .variable_id = V_WFF }, .{ .terminal_id = T_OR }, .{ .variable_id = V_WFF }, .{ .terminal_id = T_RPAREN } } };
-    const r5 = Production{ .lhs = .{ .variable_id = V_WFF }, .rhs = &[_]SymbolId{ .{ .terminal_id = T_LPAREN }, .{ .variable_id = V_WFF }, .{ .terminal_id = T_COND }, .{ .variable_id = V_WFF }, .{ .terminal_id = T_RPAREN } } };
-    const r6 = Production{ .lhs = .{ .variable_id = V_WFF }, .rhs = &[_]SymbolId{ .{ .terminal_id = T_LPAREN }, .{ .variable_id = V_WFF }, .{ .terminal_id = T_BICOND }, .{ .variable_id = V_WFF }, .{ .terminal_id = T_RPAREN } } };
+    const r0 = Production{ .lhs = V_S, .rhs = &[_]SymbolId{.{ .variable_id = V_WFF }} };
+    const r1 = Production{ .lhs = V_WFF, .rhs = &[_]SymbolId{.{ .terminal_id = T_PROPOSITION }} };
+    const r2 = Production{ .lhs = V_WFF, .rhs = &[_]SymbolId{ .{ .terminal_id = T_NOT }, .{ .variable_id = V_WFF } } };
+    const r3 = Production{ .lhs = V_WFF, .rhs = &[_]SymbolId{ .{ .terminal_id = T_LPAREN }, .{ .variable_id = V_WFF }, .{ .terminal_id = T_AND }, .{ .variable_id = V_WFF }, .{ .terminal_id = T_RPAREN } } };
+    const r4 = Production{ .lhs = V_WFF, .rhs = &[_]SymbolId{ .{ .terminal_id = T_LPAREN }, .{ .variable_id = V_WFF }, .{ .terminal_id = T_OR }, .{ .variable_id = V_WFF }, .{ .terminal_id = T_RPAREN } } };
+    const r5 = Production{ .lhs = V_WFF, .rhs = &[_]SymbolId{ .{ .terminal_id = T_LPAREN }, .{ .variable_id = V_WFF }, .{ .terminal_id = T_COND }, .{ .variable_id = V_WFF }, .{ .terminal_id = T_RPAREN } } };
+    const r6 = Production{ .lhs = V_WFF, .rhs = &[_]SymbolId{ .{ .terminal_id = T_LPAREN }, .{ .variable_id = V_WFF }, .{ .terminal_id = T_BICOND }, .{ .variable_id = V_WFF }, .{ .terminal_id = T_RPAREN } } };
 
     const expected_grammar = G{
         .rules = &[_]Production{ r0, r1, r2, r3, r4, r5, r6 },
@@ -815,18 +822,18 @@ test "Grammar.initFromTuples [grammar2.2]" {
         TestTerminal.End,
     );
 
-    const r0 = Production{ .lhs = .{ .variable_id = V_S }, .rhs = &[_]SymbolId{.{ .variable_id = V_WFF1 }} };
-    const r1 = Production{ .lhs = .{ .variable_id = V_WFF1 }, .rhs = &[_]SymbolId{.{ .variable_id = V_WFF2 }} };
-    const r2 = Production{ .lhs = .{ .variable_id = V_WFF1 }, .rhs = &[_]SymbolId{ .{ .variable_id = V_WFF1 }, .{ .terminal_id = T_BICOND }, .{ .variable_id = V_WFF2 } } };
-    const r3 = Production{ .lhs = .{ .variable_id = V_WFF2 }, .rhs = &[_]SymbolId{.{ .variable_id = V_WFF3 }} };
-    const r4 = Production{ .lhs = .{ .variable_id = V_WFF2 }, .rhs = &[_]SymbolId{ .{ .variable_id = V_WFF2 }, .{ .terminal_id = T_COND }, .{ .variable_id = V_WFF3 } } };
-    const r5 = Production{ .lhs = .{ .variable_id = V_WFF3 }, .rhs = &[_]SymbolId{.{ .variable_id = V_WFF4 }} };
-    const r6 = Production{ .lhs = .{ .variable_id = V_WFF3 }, .rhs = &[_]SymbolId{ .{ .variable_id = V_WFF3 }, .{ .terminal_id = T_OR }, .{ .variable_id = V_WFF4 } } };
-    const r7 = Production{ .lhs = .{ .variable_id = V_WFF3 }, .rhs = &[_]SymbolId{ .{ .variable_id = V_WFF3 }, .{ .terminal_id = T_AND }, .{ .variable_id = V_WFF4 } } };
-    const r8 = Production{ .lhs = .{ .variable_id = V_WFF4 }, .rhs = &[_]SymbolId{.{ .variable_id = V_PROP }} };
-    const r9 = Production{ .lhs = .{ .variable_id = V_WFF4 }, .rhs = &[_]SymbolId{ .{ .terminal_id = T_NOT }, .{ .variable_id = V_WFF4 } } };
-    const r10 = Production{ .lhs = .{ .variable_id = V_PROP }, .rhs = &[_]SymbolId{ .{ .terminal_id = T_LPAREN }, .{ .variable_id = V_WFF1 }, .{ .terminal_id = T_RPAREN } } };
-    const r11 = Production{ .lhs = .{ .variable_id = V_PROP }, .rhs = &[_]SymbolId{.{ .terminal_id = T_PROPTOK }} };
+    const r0 = Production{ .lhs = V_S, .rhs = &[_]SymbolId{.{ .variable_id = V_WFF1 }} };
+    const r1 = Production{ .lhs = V_WFF1, .rhs = &[_]SymbolId{.{ .variable_id = V_WFF2 }} };
+    const r2 = Production{ .lhs = V_WFF1, .rhs = &[_]SymbolId{ .{ .variable_id = V_WFF1 }, .{ .terminal_id = T_BICOND }, .{ .variable_id = V_WFF2 } } };
+    const r3 = Production{ .lhs = V_WFF2, .rhs = &[_]SymbolId{.{ .variable_id = V_WFF3 }} };
+    const r4 = Production{ .lhs = V_WFF2, .rhs = &[_]SymbolId{ .{ .variable_id = V_WFF2 }, .{ .terminal_id = T_COND }, .{ .variable_id = V_WFF3 } } };
+    const r5 = Production{ .lhs = V_WFF3, .rhs = &[_]SymbolId{.{ .variable_id = V_WFF4 }} };
+    const r6 = Production{ .lhs = V_WFF3, .rhs = &[_]SymbolId{ .{ .variable_id = V_WFF3 }, .{ .terminal_id = T_OR }, .{ .variable_id = V_WFF4 } } };
+    const r7 = Production{ .lhs = V_WFF3, .rhs = &[_]SymbolId{ .{ .variable_id = V_WFF3 }, .{ .terminal_id = T_AND }, .{ .variable_id = V_WFF4 } } };
+    const r8 = Production{ .lhs = V_WFF4, .rhs = &[_]SymbolId{.{ .variable_id = V_PROP }} };
+    const r9 = Production{ .lhs = V_WFF4, .rhs = &[_]SymbolId{ .{ .terminal_id = T_NOT }, .{ .variable_id = V_WFF4 } } };
+    const r10 = Production{ .lhs = V_PROP, .rhs = &[_]SymbolId{ .{ .terminal_id = T_LPAREN }, .{ .variable_id = V_WFF1 }, .{ .terminal_id = T_RPAREN } } };
+    const r11 = Production{ .lhs = V_PROP, .rhs = &[_]SymbolId{.{ .terminal_id = T_PROPTOK }} };
 
     const expected_grammar = G{
         .rules = &[_]Production{ r0, r1, r2, r3, r4, r5, r6, r7, r8, r9, r10, r11 },

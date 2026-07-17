@@ -213,7 +213,7 @@ pub fn ParseTable(comptime Variable: type, comptime Terminal: type) type {
                             // the stack.
                             if (variable_branches[id].items.len == 0) {
                                 for (grammar.rules) |rule| {
-                                    if (sym.eql(rule.lhs)) {
+                                    if (sym.eqlVariable(rule.lhs)) {
                                         try stack.append(allocator, ProductionInstance.fromProduction(rule));
                                     }
                                 }
@@ -258,7 +258,7 @@ pub fn ParseTable(comptime Variable: type, comptime Terminal: type) type {
                             // the stack.
                             if (variable_branches[id].len == 0) {
                                 for (grammar.rules) |rule| {
-                                    if (sym.eql(rule.lhs)) {
+                                    if (sym.eqlVariable(rule.lhs)) {
                                         stack = stack ++ &[_]ProductionInstance {ProductionInstance.fromProduction(rule)};
                                     }
                                 }
@@ -387,7 +387,7 @@ pub fn ParseTable(comptime Variable: type, comptime Terminal: type) type {
 
                     const rule_id = grammar.getRuleId(instance.production).?;
                     for (0..grammar.getTerminalCount()) |t_id| {
-                        if (!follow_set[instance.production.lhs.variable_id * grammar.getTerminalCount() + t_id]) continue;
+                        if (!follow_set[instance.production.lhs * grammar.getTerminalCount() + t_id]) continue;
 
                         action_table.items[state_num][t_id] = try switch (action_table.items[state_num][t_id]) {
                             .invalid => Action{ .reduce = rule_id },
@@ -398,7 +398,7 @@ pub fn ParseTable(comptime Variable: type, comptime Terminal: type) type {
                     }
 
                     // TODO: hardcoded 0 kinda yucky
-                    if (instance.production.lhs.variable_id == grammar.getStartSymbolId().variable_id) {
+                    if (instance.production.lhs == grammar.getStartSymbolId().variable_id) {
                         switch (action_table.items[state_num][grammar.getEndSymbolId().terminal_id]) {
                             .invalid => return TableGeneratorError.acceptError,
                             .state => return TableGeneratorError.shiftAcceptError,
@@ -514,7 +514,7 @@ pub fn ParseTable(comptime Variable: type, comptime Terminal: type) type {
 
                         const rule_id = grammar.getRuleId(instance.production).?;
                         for (0..grammar.getTerminalCount()) |t_id| {
-                            if (!follow_set[instance.production.lhs.variable_id * grammar.getTerminalCount() + t_id]) continue;
+                            if (!follow_set[instance.production.lhs * grammar.getTerminalCount() + t_id]) continue;
 
                             const new_action = switch (action_table[state_num_][t_id]) {
                                 .invalid => Action{ .reduce = rule_id },
@@ -527,7 +527,7 @@ pub fn ParseTable(comptime Variable: type, comptime Terminal: type) type {
                         }
 
                         // TODO: hardcoded 0 kinda yucky
-                        if (instance.production.lhs.variable_id == grammar.getStartSymbolId().variable_id) {
+                        if (instance.production.lhs == grammar.getStartSymbolId().variable_id) {
                             switch (action_table[state_num_][grammar.getEndSymbolId().terminal_id]) {
                                 .invalid => @compileError("Parsing error: missing accepting reduction"),
                                 .state => @compileError("Parsing error: shift accept error"),
