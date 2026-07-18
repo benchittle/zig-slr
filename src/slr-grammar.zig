@@ -3,6 +3,8 @@ const std = @import("std");
 const test_common = @import("test-common.zig");
 const utils = @import("utils.zig");
 
+/// A numerical ID associated with a symbol in a formal grammar (a variable or a
+/// terminal).
 pub const SymbolId = union(enum) {
     const Self = @This();
     const VariableId = u16;
@@ -32,9 +34,11 @@ pub const SymbolId = union(enum) {
     }
 };
 
+/// A single rule / production in a formal grammar.
+/// * `lhs` is the grammar variable on the left side of the production,
+/// * `rhs` is the sequence of grammar variables and/or terminals on the right
+///   side of the production (produced by the production)
 pub const Production = struct {
-    // TODO: Both of these helper structs should probably have dynamically
-    // allocated strings
     const Self = @This();
 
     lhs: SymbolId.VariableId,
@@ -201,43 +205,44 @@ pub fn Grammar(comptime Variable: type, comptime Terminal: type) type {
             const RuleTuplesType = @TypeOf(rule_tuples);
             const rule_tuples_type_info = @typeInfo(RuleTuplesType);
 
-            // Verify rule_tuples is a tuple (struct with no named fields)
+            // Verify rule_tuples is a tuple (struct with no named fields).
             if (rule_tuples_type_info != .@"struct" or !rule_tuples_type_info.@"struct".is_tuple) {
                 @compileError("Expected tuple of rules. Cannot use '" ++ @typeName(RuleTuplesType) ++ "'");
             }
-            // Verify rule_tuples is not empty
+            // Verify rule_tuples is not empty.
             if (std.meta.fields(RuleTuplesType).len == 0) {
                 @compileError("rule_tuples cannot be empty");
             }
 
-            // Verify each field in rule_tuples is a valid grammar rule
+            // Verify each field in rule_tuples is a valid grammar rule.
             inline for (std.meta.fieldNames(RuleTuplesType), 0..) |rule_tuples_field_name, i| {
                 const rule = @field(rule_tuples, rule_tuples_field_name);
                 const RuleType = @TypeOf(rule);
                 const rule_type_info = @typeInfo(RuleType);
 
-                // Each rule should be a tuple
+                // Each rule should be a tuple.
                 if (rule_type_info != .@"struct" or !rule_type_info.@"struct".is_tuple) {
                     @compileError(std.fmt.comptimePrint("Each rule must be a tuple, found '" ++ @typeName(rule) ++ "' (rule {d})", .{i}));
                 }
-                // Each rule should have exactly 2 fields
+                // Each rule should have exactly 2 fields.
                 if (std.meta.fields(RuleType).len != 2) {
                     @compileError(std.fmt.comptimePrint("Each rule must have exactly 2 fields, found {d} fields (rule {d})", .{ rule_type_info.fields.len, i }));
                 }
 
-                // The first field of each rule should be of type V
+                // The first field of each rule should be of type Variable.
                 const lhs = rule.@"0";
                 if (@TypeOf(lhs) != Variable) {
                     @compileError(std.fmt.comptimePrint("The first field in each rule tuple must be of type '" ++ @typeName(Variable) ++ "', found '" ++ @typeName(@TypeOf(rule.@"0")) ++ "' (rule {d})", .{i}));
                 }
 
                 // The second field of each rule should be a tuple with fields
-                // of type V or T (the right hand side of a production).
+                // of type Variable or Terminal (the right hand side of a
+                // production).
                 const rhs = rule.@"1";
                 const RhsType = @TypeOf(rhs);
                 const rhs_type_info = @typeInfo(RhsType);
 
-                // Verify rhs is a tuple (struct with no named fields)
+                // Verify rhs is a tuple (struct with no named fields).
                 if (rhs_type_info != .@"struct" or !rhs_type_info.@"struct".is_tuple) {
                     @compileError(std.fmt.comptimePrint("The second field in each rule tuple must be a tuple, found '" ++ @typeName(RuleTuplesType) ++ "' (rule {d})", .{i}));
                 }
@@ -246,7 +251,7 @@ pub fn Grammar(comptime Variable: type, comptime Terminal: type) type {
                     @compileError(std.fmt.comptimePrint("The second field (a tuple) in each rule tuple cannot be empty (rule {d})", .{i}));
                 }
 
-                // Verify each symbol in rhs is of type T or V
+                // Verify each symbol in rhs is of type Terminal or Variable.
                 inline for (std.meta.fieldNames(RhsType), 0..) |rhs_field_name, j| {
                     const rhs_symbol = @field(rhs, rhs_field_name);
                     const RhsSymbolType = @TypeOf(rhs_symbol);
