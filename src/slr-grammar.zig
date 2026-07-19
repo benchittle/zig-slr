@@ -562,8 +562,6 @@ pub fn Grammar(comptime Variable: type, comptime Terminal: type) type {
 
         /// Caller must provide buffers with the necessary room:
         /// * `follow_set: [self.getVariableCount() * self.getTerminalCount()]bool`
-        /// * `seen: [self.getVariableCount()]bool`
-        /// * `stack_buffer: [self.getVariableCount()]Symbol`
         ///
         /// Caller must also provide a **populated** `first_set` table.
         ///
@@ -571,69 +569,42 @@ pub fn Grammar(comptime Variable: type, comptime Terminal: type) type {
         /// can be freed immediately if they were dynamically allocated.
         fn computeFollowSet(
             self: Self,
-            follow_set: []bool,
-            seen: []bool,
-            stack_buffer: []SymbolId.VariableId,
-            first_set: []const bool,
+            follow_set: utils.Slice2d([]bool),
+            first_set: utils.Slice2d([]const bool),
         ) void {
-            std.debug.assert(follow_set.len >= self.getVariableCount() * self.getTerminalCount());
-            std.debug.assert(seen.len >= self.getVariableCount());
-            std.debug.assert(stack_buffer.len >= self.getVariableCount());
-            std.debug.assert(first_set.len >= self.getVariableCount() * self.getTerminalCount());
+            std.debug.assert(follow_set.slice.len >= self.getVariableCount() * self.getTerminalCount());
+            std.debug.assert(first_set.slice.len >= self.getVariableCount() * self.getTerminalCount());
 
-            const first_set_2d_view = utils.Slice2d([]const bool).init(first_set, self.getTerminalCount());
+            @memset(follow_set.slice, false);
 
-            @memset(follow_set, false);
-            var follow_set_2d_view = utils.Slice2d([]bool).init(follow_set, self.getTerminalCount());
+            // Initialize FOLLOW(startsymbol) to include the end terminal.
+            follow_set.row(0)[follow_set.row_length - 1] = true;
 
-            // Initialize FOLLOW(startsymbol) to include end of input symbol.
-            follow_set_2d_view.row(0)[follow_set_2d_view.row_length - 1] = true;
-
-            for (0..self.getVariableCount()) |v_id| {
-                @memset(seen, false);
-                seen[v_id] = true; // redundant?
-
-                var stack = std.ArrayListUnmanaged(SymbolId.VariableId).initBuffer(stack_buffer);
-                stack.appendAssumeCapacity(@intCast(v_id));
-
-                while (stack.pop()) |top_var_id| {
-                    for (self.rules) |rule| {
-                        for (rule.rhs[0 .. rule.rhs.len - 1], 0..) |rhs_symbol, i| {
-                            if (!rhs_symbol.eqlVariable(top_var_id)) {
-                                continue;
-                            }
-
-                            switch (rule.rhs[i + 1]) {
-                                .terminal_id => |id| follow_set_2d_view.row(v_id)[id] = true,
-                                // TODO: Make union function?
-                                .variable_id => |id| for (first_set_2d_view.row(id), 0..) |is_first, terminal_id| {
-                                    if (is_first) {
-                                        follow_set_2d_view.row(v_id)[terminal_id] = true;
-                                    }
-                                },
-                            }
+            // Iterate through each rhs of each grammar rule. Whenever we come
+            // across, a variable, look at the next symbol: if its a terminal,
+            // add it to the variable's FOLLOW set; if it's another variable,
+            // union its FIRST set into the current variable's FOLLOW set.
+            for (self.rules) |rule| {
+                for (rule.rhs[0..(rule.rhs.len - 1)], rule.rhs[1..rule.rhs.len]) |symbol_id, next_symbol_id| {
+                    switch (symbol_id) {
+                        .terminal_id => continue,
+                        .variable_id => |v_id| switch (next_symbol_id) {
+                            .terminal_id => |next_t_id| follow_set.row(v_id)[next_t_id] = true,
+                            .variable_id => |next_v_id| utils.sliceUnion(follow_set.row(v_id), first_set.row(next_v_id)),
                         }
-
-                        // Handle the last RHS symbol separatly //
-
-                        const last_rhs_symbol = rule.rhs[rule.rhs.len - 1];
-                        if (!last_rhs_symbol.eqlVariable(top_var_id) or seen[rule.lhs]) {
-                            continue;
-                        }
-                        // Check if we already have the Follow set for this variable
-                        // TODO: Make this more explicit?
-                        if (rule.lhs < v_id) {
-                            for (follow_set_2d_view.row(rule.lhs), 0..) |is_follow, terminal_id| {
-                                if (is_follow) {
-                                    follow_set_2d_view.row(v_id)[terminal_id] = true;
-                                }
-                            }
-                        } else {
-                            stack.appendAssumeCapacity(rule.lhs);
-                        }
-                        seen[rule.lhs] = true;
                     }
                 }
+            }
+
+            // Propagate FOLLOW sets for any productions whose rhs ends with a
+            // variable.
+            for (self.rules) |rule| {
+                const end_v_id = switch (rule.rhs[rule.rhs.len - 1]) {
+                    .terminal_id => continue,
+                    .variable_id => |v_id| v_id,
+                };
+
+                utils.rowUnion(follow_set, end_v_id, rule.lhs);
             }
         }
 
@@ -673,10 +644,11 @@ pub fn Grammar(comptime Variable: type, comptime Terminal: type) type {
 
             const follow_set_buffer = try allocator.alloc(bool, self.getVariableCount() * self.getTerminalCount());
             errdefer allocator.free(follow_set_buffer);
-            const stack_buffer = try allocator.alloc(SymbolId.VariableId, self.getVariableCount());
-            defer allocator.free(stack_buffer);
 
-            self.computeFollowSet(follow_set_buffer, visited_buffer, stack_buffer, first_set_buffer);
+            self.computeFollowSet(
+                utils.Slice2d([]bool).init(follow_set_buffer, self.getTerminalCount()),
+                utils.Slice2d([]const bool).init(first_set_buffer, self.getTerminalCount()),
+            );
             return follow_set_buffer;
         }
 
@@ -700,9 +672,11 @@ pub fn Grammar(comptime Variable: type, comptime Terminal: type) type {
                 );
 
                 var follow_set_buffer: [self.getVariableCount() * self.getTerminalCount()]bool = undefined;
-                var stack_buffer: [self.getVariableCount()]SymbolId.VariableId = undefined;
 
-                self.computeFollowSet(&follow_set_buffer, &visited_buffer, &stack_buffer, &first_set_buffer);
+                self.computeFollowSet(
+                    utils.Slice2d([]bool).init(&follow_set_buffer, self.getTerminalCount()),
+                    utils.Slice2d([]const bool).init(&first_set_buffer, self.getTerminalCount()),
+                );
                 return follow_set_buffer;
             }
         }
