@@ -72,11 +72,6 @@ pub const Production = struct {
     }
 };
 
-// NOTE: variables ids MUST START AT 0 and MUST BE SMALLER THAN ALL TERMINAL IDS and MUST BE ORDERED
-// NOTE: comparison of symbols is not always done using .eql in below functions, should try to make this consistent
-// NOTE: FOLLOW and FIRST sets generation code is way too nested, should ideally
-//       be broken down into smaller functions
-
 /// Representation of a formal grammar for a language.
 ///
 /// * `Variable` is the type that will be used to specify grammar variables /
