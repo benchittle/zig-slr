@@ -86,7 +86,6 @@ pub fn ParseTable(comptime Variable: type, comptime Terminal: type) type {
 
         pub fn initComptime(comptime grammar: GrammarType) Self {
             comptime {
-                @setEvalBranchQuota(10000);
                 const goto_table, const action_table = generateTablesComptime(grammar);
                 return Self{
                     .grammar = grammar,
@@ -105,11 +104,6 @@ pub fn ParseTable(comptime Variable: type, comptime Terminal: type) type {
         pub fn getStartState(_: Self) StateIdx {
             return 0;
         }
-
-        // pub fn lookupTerminal(self: Self, state: StateIdx, terminal: Terminal) Action {
-        //     const terminal_idx = self.grammar.getSymbolFromTerminal(terminal).?.terminal;
-        //     return self.action_table[state][terminal_idx];
-        // }
 
         pub fn lookupSymbol(self: Self, state: StateIdx, symbol: slr_grammar.SymbolId) Action {
             return switch (symbol) {
