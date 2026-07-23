@@ -71,7 +71,6 @@ pub fn ParseTable(comptime Variable: type, comptime Terminal: type) type {
 
         pub const StateIdx = usize;
 
-        allocator: ?std.mem.Allocator,
         grammar: GrammarType,
         goto_table: []const []const Action,
         action_table: []const []const Action,
@@ -79,7 +78,6 @@ pub fn ParseTable(comptime Variable: type, comptime Terminal: type) type {
         pub fn init(allocator: std.mem.Allocator, grammar: GrammarType) !Self {
             const goto_table, const action_table = try generateTables(allocator, grammar);
             return Self{
-                .allocator = allocator,
                 .grammar = grammar,
                 .goto_table = goto_table,
                 .action_table = action_table,
@@ -91,7 +89,6 @@ pub fn ParseTable(comptime Variable: type, comptime Terminal: type) type {
                 @setEvalBranchQuota(10000);
                 const goto_table, const action_table = generateTablesComptime(grammar);
                 return Self{
-                    .allocator = null,
                     .grammar = grammar,
                     .goto_table = goto_table,
                     .action_table = action_table,
@@ -100,15 +97,9 @@ pub fn ParseTable(comptime Variable: type, comptime Terminal: type) type {
         }
 
         /// Note: Does NOT free the memory associated with the grammar
-        pub fn deinit(self: Self) void {
-            if (self.allocator) |allocator| {
-                for (self.goto_table, self.action_table) |goto_row, action_row| {
-                    allocator.free(goto_row);
-                    allocator.free(action_row);
-                }
-                allocator.free(self.goto_table);
-                allocator.free(self.action_table);
-            }
+        pub fn deinit(self: Self, allocator: std.mem.Allocator) void {
+            allocator.free(self.goto_table.slice);
+            allocator.free(self.action_table.slice);
         }
 
         pub fn getStartState(_: Self) StateIdx {
@@ -647,7 +638,6 @@ test "Create parse table [grammar1.0]" {
     const P = ParseTable(TestVariable, TestTerminal);
 
     const expected_table = P {
-        .allocator = null,
         .grammar = grammar,
         .goto_table = &[_][]const P.Action {
             &[_]P.Action { .{.invalid = {}}, .{.state = 1} },
@@ -700,10 +690,9 @@ test "Create parse table [grammar1.0]" {
     };
 
     const table = try P.init(std.testing.allocator, grammar);
-    defer table.deinit();
+    defer table.deinit(std.testing.allocator);
 
     const table_comptime = comptime P.initComptime(grammar);
-    defer table_comptime.deinit();
 
     try std.testing.expectEqualDeep(expected_table.goto_table, table.goto_table);
     try std.testing.expectEqualDeep(expected_table.action_table, table.action_table);
@@ -747,10 +736,9 @@ test "Create parse table [grammar2.0]" {
     const P = ParseTable(TestVariable, TestTerminal);
 
     const table = try P.init(std.testing.allocator, grammar);
-    defer table.deinit();
+    defer table.deinit(std.testing.allocator);
 
     const table_comptime = comptime P.initComptime(grammar);
-    defer table_comptime.deinit();
 
     // table.printDebugTable();
 
