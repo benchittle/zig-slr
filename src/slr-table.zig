@@ -2,6 +2,7 @@ const std = @import("std");
 
 const slr_grammar = @import("slr-grammar.zig");
 const test_common = @import("test-common.zig");
+const utils = @import("utils.zig");
 
 pub const TableGeneratorError = error{
     shiftShiftError,
@@ -72,8 +73,8 @@ pub fn ParseTable(comptime Variable: type, comptime Terminal: type) type {
         pub const StateIdx = usize;
 
         grammar: GrammarType,
-        goto_table: []const []const Action,
-        action_table: []const []const Action,
+        goto_table: utils.Slice2d([]const Action),
+        action_table: utils.Slice2d([]const Action),
 
         pub fn init(allocator: std.mem.Allocator, grammar: GrammarType) !Self {
             const goto_table, const action_table = try generateTables(allocator, grammar);
@@ -107,8 +108,8 @@ pub fn ParseTable(comptime Variable: type, comptime Terminal: type) type {
 
         pub fn lookupSymbol(self: Self, state: StateIdx, symbol: slr_grammar.SymbolId) Action {
             return switch (symbol) {
-                .terminal_id => |t_id| self.action_table[state][t_id],
-                .variable_id => |v_id| self.goto_table[state][v_id],
+                .terminal_id => |t_id| self.action_table.row(state)[t_id],
+                .variable_id => |v_id| self.goto_table.row(state)[v_id],
             };
         }
 
@@ -134,7 +135,12 @@ pub fn ParseTable(comptime Variable: type, comptime Terminal: type) type {
             }
             std.debug.print("|", .{});
 
-            for (self.action_table, self.goto_table, 0..) |action_row, goto_row, s| {
+            var goto_it = self.goto_table.iterRows();
+            var action_it = self.action_table.iterRows();
+            var s: usize = 0;
+            while (goto_it.next()) |goto_row| : (s += 1) {
+                const action_row = action_it.next().?;
+
                 std.debug.print("\n{d: >" ++ COL_SPACE ++ "} ||", .{s});
                 for (action_row) |entry| switch (entry) {
                     .state => |state_num| std.debug.print(" {d: ^" ++ COL_SPACE ++ "} |", .{state_num}),
@@ -277,7 +283,10 @@ pub fn ParseTable(comptime Variable: type, comptime Terminal: type) type {
             return null;
         }
 
-        fn generateTables(allocator: std.mem.Allocator, grammar: GrammarType) !struct { [][]Action, [][]Action } {
+        fn generateTables(
+            allocator: std.mem.Allocator,
+            grammar: GrammarType
+        ) !struct {utils.Slice2d([]const Action), utils.Slice2d([]const Action)} {
             var goto_table = std.ArrayList([]Action).empty;
             defer goto_table.deinit(allocator);
             errdefer for (goto_table.items) |row| {
@@ -399,7 +408,30 @@ pub fn ParseTable(comptime Variable: type, comptime Terminal: type) type {
                     }
                 }
             }
-            return .{ try goto_table.toOwnedSlice(allocator), try action_table.toOwnedSlice(allocator) };
+            const goto_slice = try allocator.alloc(Action, goto_table.items.len * goto_table.items[0].len);
+            const action_slice = try allocator.alloc(Action, action_table.items.len * action_table.items[0].len);
+
+            var goto_view = utils.Slice2d([]Action).init(goto_slice, goto_table.items[0].len);
+            var action_view = utils.Slice2d([]Action).init(action_slice, action_table.items[0].len);
+
+            for (goto_table.items, 0..) |row, i| {
+                @memcpy(goto_view.row(i), row);
+            }
+            for (action_table.items, 0..) |row, i| {
+                @memcpy(action_view.row(i), row);
+            }
+
+            const goto_const_view = utils.Slice2d([]const Action).init(goto_slice, goto_table.items[0].len);
+            const action_const_view = utils.Slice2d([]const Action).init(action_slice, action_table.items[0].len);
+
+            for (0..goto_table.items.len) |i| {
+                allocator.free(goto_table.items[i]);
+            }
+            for (0..action_table.items.len) |i| {
+                allocator.free(action_table.items[i]);
+            }
+
+            return .{goto_const_view, action_const_view};
         }
 
         fn generateTablesComptime(comptime grammar: GrammarType) struct { []const []const Action, []const []const Action } {
@@ -633,54 +665,60 @@ test "Create parse table [grammar1.0]" {
 
     const expected_table = P {
         .grammar = grammar,
-        .goto_table = &[_][]const P.Action {
-            &[_]P.Action { .{.invalid = {}}, .{.state = 1} },
-            &[_]P.Action { .{.invalid = {}}, .{.invalid = {}} },
-            &[_]P.Action { .{.invalid = {}}, .{.invalid = {}} },
-            &[_]P.Action { .{.invalid = {}}, .{.state = 5} },
-            &[_]P.Action { .{.invalid = {}}, .{.state = 6} },
+        .goto_table = utils.Slice2d([]const P.Action).init(
+            &[_] P.Action {
+                .{.invalid = {}}, .{.state = 1},
+                .{.invalid = {}}, .{.invalid = {}},
+                .{.invalid = {}}, .{.invalid = {}},
+                .{.invalid = {}}, .{.state = 5},
+                .{.invalid = {}}, .{.state = 6},
 
-            &[_]P.Action { .{.invalid = {}}, .{.invalid = {}} },
-            &[_]P.Action { .{.invalid = {}}, .{.invalid = {}} },
-            &[_]P.Action { .{.invalid = {}}, .{.state = 11} },
-            &[_]P.Action { .{.invalid = {}}, .{.state = 12} },
-            &[_]P.Action { .{.invalid = {}}, .{.state = 13} },
+                .{.invalid = {}}, .{.invalid = {}},
+                .{.invalid = {}}, .{.invalid = {}},
+                .{.invalid = {}}, .{.state = 11},
+                .{.invalid = {}}, .{.state = 12},
+                .{.invalid = {}}, .{.state = 13},
 
-            &[_]P.Action { .{.invalid = {}}, .{.state = 14} },
-            &[_]P.Action { .{.invalid = {}}, .{.invalid = {}} },
-            &[_]P.Action { .{.invalid = {}}, .{.invalid = {}} },
-            &[_]P.Action { .{.invalid = {}}, .{.invalid = {}} },
-            &[_]P.Action { .{.invalid = {}}, .{.invalid = {}} },
+                .{.invalid = {}}, .{.state = 14},
+                .{.invalid = {}}, .{.invalid = {}},
+                .{.invalid = {}}, .{.invalid = {}},
+                .{.invalid = {}}, .{.invalid = {}},
+                .{.invalid = {}}, .{.invalid = {}},
 
-            &[_]P.Action { .{.invalid = {}}, .{.invalid = {}} },
-            &[_]P.Action { .{.invalid = {}}, .{.invalid = {}} },
-            &[_]P.Action { .{.invalid = {}}, .{.invalid = {}} },
-            &[_]P.Action { .{.invalid = {}}, .{.invalid = {}} },
-        },
-        .action_table = &[_][]const P.Action {
-            &[_]P.Action { .{.state = 2}, .{.state = 3}, .{.state = 4}, .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}} },
-            &[_]P.Action { .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}}, .{.accept = {}} },
-            &[_]P.Action { .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}}, .{.reduce = 1}, .{.reduce = 1}, .{.reduce = 1}, .{.reduce = 1}, .{.reduce = 1}, .{.reduce = 1} },
-            &[_]P.Action { .{.state = 2}, .{.state = 3}, .{.state = 4}, .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}} },
-            &[_]P.Action { .{.state = 2}, .{.state = 3}, .{.state = 4}, .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}} },
+                .{.invalid = {}}, .{.invalid = {}},
+                .{.invalid = {}}, .{.invalid = {}},
+                .{.invalid = {}}, .{.invalid = {}},
+                .{.invalid = {}}, .{.invalid = {}},
+            },
+            grammar.getVariableCount(),
+        ),
+        .action_table = utils.Slice2d([]const P.Action).init(
+            &[_]P.Action {
+                .{.state = 2}, .{.state = 3}, .{.state = 4}, .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}},
+                .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}}, .{.accept = {}},
+                .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}}, .{.reduce = 1}, .{.reduce = 1}, .{.reduce = 1}, .{.reduce = 1}, .{.reduce = 1}, .{.reduce = 1},
+                .{.state = 2}, .{.state = 3}, .{.state = 4}, .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}},
+                .{.state = 2}, .{.state = 3}, .{.state = 4}, .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}},
 
-            &[_]P.Action { .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}}, .{.reduce = 2}, .{.reduce = 2}, .{.reduce = 2}, .{.reduce = 2}, .{.reduce = 2}, .{.reduce = 2} },
-            &[_]P.Action { .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}}, .{.state = 7}, .{.invalid = {}}, .{.state = 8}, .{.state = 9}, .{.state = 10},  .{.invalid = {}} },
-            &[_]P.Action { .{.state = 2}, .{.state = 3}, .{.state = 4}, .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}} },
-            &[_]P.Action { .{.state = 2}, .{.state = 3}, .{.state = 4}, .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}} },
-            &[_]P.Action { .{.state = 2}, .{.state = 3}, .{.state = 4}, .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}} },
+                .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}}, .{.reduce = 2}, .{.reduce = 2}, .{.reduce = 2}, .{.reduce = 2}, .{.reduce = 2}, .{.reduce = 2},
+                .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}}, .{.state = 7}, .{.invalid = {}}, .{.state = 8}, .{.state = 9}, .{.state = 10},  .{.invalid = {}},
+                .{.state = 2}, .{.state = 3}, .{.state = 4}, .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}},
+                .{.state = 2}, .{.state = 3}, .{.state = 4}, .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}},
+                .{.state = 2}, .{.state = 3}, .{.state = 4}, .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}},
 
-            &[_]P.Action { .{.state = 2}, .{.state = 3}, .{.state = 4}, .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}} },
-            &[_]P.Action { .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}}, .{.state = 15}, .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}} },
-            &[_]P.Action { .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}}, .{.state = 16}, .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}} },
-            &[_]P.Action { .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}}, .{.state = 17}, .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}} },
-            &[_]P.Action { .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}}, .{.state = 18}, .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}} },
+                .{.state = 2}, .{.state = 3}, .{.state = 4}, .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}},
+                .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}}, .{.state = 15}, .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}},
+                .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}}, .{.state = 16}, .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}},
+                .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}}, .{.state = 17}, .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}},
+                .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}}, .{.state = 18}, .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}},
 
-            &[_]P.Action { .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}}, .{.reduce = 3}, .{.reduce = 3}, .{.reduce = 3}, .{.reduce = 3}, .{.reduce = 3}, .{.reduce = 3} },
-            &[_]P.Action { .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}}, .{.reduce = 4}, .{.reduce = 4}, .{.reduce = 4}, .{.reduce = 4}, .{.reduce = 4}, .{.reduce = 4} },
-            &[_]P.Action { .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}}, .{.reduce = 5}, .{.reduce = 5}, .{.reduce = 5}, .{.reduce = 5}, .{.reduce = 5}, .{.reduce = 5} },
-            &[_]P.Action { .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}}, .{.reduce = 6}, .{.reduce = 6}, .{.reduce = 6}, .{.reduce = 6}, .{.reduce = 6}, .{.reduce = 6} },
-        }
+                .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}}, .{.reduce = 3}, .{.reduce = 3}, .{.reduce = 3}, .{.reduce = 3}, .{.reduce = 3}, .{.reduce = 3},
+                .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}}, .{.reduce = 4}, .{.reduce = 4}, .{.reduce = 4}, .{.reduce = 4}, .{.reduce = 4}, .{.reduce = 4},
+                .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}}, .{.reduce = 5}, .{.reduce = 5}, .{.reduce = 5}, .{.reduce = 5}, .{.reduce = 5}, .{.reduce = 5},
+                .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}}, .{.reduce = 6}, .{.reduce = 6}, .{.reduce = 6}, .{.reduce = 6}, .{.reduce = 6}, .{.reduce = 6},
+            },
+            grammar.getTerminalCount(),
+        )
     };
 
     const table = try P.init(std.testing.allocator, grammar);

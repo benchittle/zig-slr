@@ -11,6 +11,20 @@ pub fn Slice2d(comptime SliceType: type) type {
     return struct {
         const Self = @This();
 
+        const RowIterator = struct {
+            slice2d: Self,
+            row_num: usize,
+
+            pub fn next(self: *RowIterator) ?SliceType {
+                if (self.row_num * self.slice2d.row_length >= self.slice2d.slice.len) {
+                    return null;
+                }
+                const current_row = self.slice2d.row(self.row_num);
+                self.row_num += 1;
+                return current_row;
+            }
+        };
+
         slice: SliceType,
         row_length: usize,
 
@@ -27,8 +41,8 @@ pub fn Slice2d(comptime SliceType: type) type {
             return self.slice[start..end];
         }
 
-        pub fn lessThan(_: void, lhs: Self, rhs: Self) bool {
-            return lhs.from < rhs.from;
+        pub fn iterRows(self: Self) RowIterator {
+            return RowIterator{ .slice2d = self, .row_num = 0 };
         }
     };
 }
