@@ -37,7 +37,7 @@ pub const SymbolId = union(enum) {
 /// A single rule / production in a formal grammar.
 /// * `lhs` is the grammar variable on the left side of the production,
 /// * `rhs` is the sequence of grammar variables and/or terminals on the right
-///   side of the production (produced by the production)
+///   side of the production (produced by the production).
 pub const Production = struct {
     const Self = @This();
 
@@ -82,13 +82,13 @@ pub const Production = struct {
 /// `pub fn eql(@This(), @This()) bool`
 ///
 /// The returned struct has the following fields:
-/// * `rules` is a slice of `Production`s (the rules of the grammar). It must be
-///   sorted such that rules with a variable as the first symbol on the rhs
-///   appear before those with a terminal. Within each group they must then be
-///   sorted by symbol ID.
+/// * `rules` is a slice of `Production` objects (the rules of the grammar). It
+///   must be sorted such that every rule with a variable as the first symbol on
+///   the rhs appears before those with a terminal. Within each group they must
+///   then be sorted by symbol ID.
 /// * `variables` is a slice containing all of the user defined `Variable`
-///   objects found in the grammar rules. Each `Variable`'s symbol ID is its
-///   index in the slice.
+///   objects found in the grammar rules. Each `Variable` object's symbol ID is
+///   its index in the slice.
 ///   The start symbol will always be assigned variable symbol ID 0.
 /// * `terminals` is the same idea as `variables` but for all of the user
 ///   defined `Terminal` objects found in the grammar rules.
@@ -313,7 +313,7 @@ pub fn Grammar(comptime Variable: type, comptime Terminal: type) type {
         }
 
         /// Caller must provide buffers with the necessary room:
-        /// * `first_set_table.slice: [self.getVariableCount() * self.getTerminalCount()]`
+        /// * `first_set_table.slice: [self.getVariableCount() * self.getSymbolCount()]`
         /// * `first_var_edge_list_offsets: [self.getVariableCount() + 1]`
         /// * `populated: [self.getVariableCount()]`
         /// * `path: [self.getVariableCount()]`
@@ -331,7 +331,7 @@ pub fn Grammar(comptime Variable: type, comptime Terminal: type) type {
             path_edges_explored: []usize,
             visited: []bool,
         ) void {
-            std.debug.assert(first_set_table.slice.len == self.getVariableCount() * self.getTerminalCount());
+            std.debug.assert(first_set_table.slice.len == self.getVariableCount() * self.getSymbolCount());
             std.debug.assert(first_var_edge_list_offsets.len == self.getVariableCount() + 1);
             std.debug.assert(populated.len == self.getVariableCount());
             std.debug.assert(path.len == self.getVariableCount());
@@ -378,7 +378,7 @@ pub fn Grammar(comptime Variable: type, comptime Terminal: type) type {
             {
                 var current_key = self.rules[0].lhs;
                 var offset: usize = 0;
-                for (self.rules[0..total_edge_count], 0..) |rule, i| {
+                for (self.rules[1..total_edge_count], 1..) |rule, i| {
                     if (current_key != rule.lhs) {
                         offset = i;
                         current_key = rule.lhs;
@@ -413,11 +413,16 @@ pub fn Grammar(comptime Variable: type, comptime Terminal: type) type {
                 }
             }
 
-            // Initialize first_set_table with terminals that appear as the
+            // Initialize first_set_table with symbols that appear as the
             // first symbol on the right side of a production. We will propagate
             // these in the next step.
-            // (Start iterating from total_edge_count to skip past all the rules
-            // whose rhs starts with a variable)
+            // First do variables.
+            for (self.rules[0..total_edge_count]) |rule| {
+                const var_id = rule.lhs;
+                const first_rule_symbol_id = rule.rhs[0].variable_id;
+                first_set_table.row(var_id)[self.getTerminalCount() + first_rule_symbol_id] = true;
+            }
+            // Then do terminals.
             for (self.rules[total_edge_count..]) |rule| {
                 const var_id = rule.lhs;
                 const first_rule_symbol_id = rule.rhs[0].terminal_id;
@@ -436,7 +441,6 @@ pub fn Grammar(comptime Variable: type, comptime Terminal: type) type {
             // After all of the traversals are done, first_set_table will be
             // fully propagated / populated.
             for (0..self.getVariableCount()) |start_node| {
-                // Initialize path with the starting node.
                 var path_len: SymbolId.VariableId = 1;
                 path[0] = @intCast(start_node);
 
@@ -444,7 +448,6 @@ pub fn Grammar(comptime Variable: type, comptime Terminal: type) type {
                 // each node along the path.
                 @memset(path_edges_explored, 0);
 
-                // Used to track which nodes have already been visited.
                 @memset(visited, false);
                 visited[start_node] = true;
 
@@ -500,16 +503,20 @@ pub fn Grammar(comptime Variable: type, comptime Terminal: type) type {
         }
 
         /// Computes the FIRST set for the grammar as a table. Each row
-        /// represents a grammar variable, each column a grammar terminal. If
-        /// row x, column y is true, then the y'th terminal is in the x'th
-        /// variable's FIRST set.
+        /// represents a grammar variable, each column a grammar symbol (a
+        /// column for each terminal first, followed by a column for each
+        /// variable). If row x, column y is true, then
+        /// if y < self.getTerminalCount(), the *terminal* with ID y is in
+        ///   the FIRST set of the variable with ID x;
+        /// otherwise, the *variable* with ID (self.getTerminalCount() - y) is
+        ///   in the FIRST set of the variable with ID x.
         ///
         /// The returned slice should be interpreted as a row-wise 2D array as
         /// described above. Caller must free.
         ///
         /// NOTE: $ (END character) can never be first
         pub fn getFirstSet(self: Self, allocator: std.mem.Allocator) ![]bool {
-            const first_set_buffer = try allocator.alloc(bool, self.getVariableCount() * self.getTerminalCount());
+            const first_set_buffer = try allocator.alloc(bool, self.getVariableCount() * self.getSymbolCount());
             errdefer allocator.free(first_set_buffer);
             const first_var_edge_list_offsets_buffer = try allocator.alloc(usize, self.getVariableCount() + 1);
             defer allocator.free(first_var_edge_list_offsets_buffer);
@@ -523,7 +530,7 @@ pub fn Grammar(comptime Variable: type, comptime Terminal: type) type {
             defer allocator.free(visited_buffer);
 
             self.computeFirstSet(
-                utils.Slice2d([]bool).init(first_set_buffer, self.getTerminalCount()),
+                utils.Slice2d([]bool).init(first_set_buffer, self.getSymbolCount()),
                 first_var_edge_list_offsets_buffer,
                 populated_buffer,
                 path_buffer,
@@ -534,9 +541,9 @@ pub fn Grammar(comptime Variable: type, comptime Terminal: type) type {
         }
 
         /// Comptime version of `getFirstSet()`, no dynamic allocation needed.
-        pub fn getFirstSetComptime(comptime self: Self) [self.getVariableCount() * self.getTerminalCount()]bool {
+        pub fn getFirstSetComptime(comptime self: Self) [self.getVariableCount() * self.getSymbolCount()]bool {
             comptime {
-                var first_set_buffer: [self.getVariableCount() * self.getTerminalCount()]bool = undefined;
+                var first_set_buffer: [self.getVariableCount() * self.getSymbolCount()]bool = undefined;
                 var first_var_edge_list_offsets_buffer: [self.getVariableCount() + 1]usize = undefined;
                 var populated_buffer: [self.getVariableCount()]bool = undefined;
                 var path_buffer: [self.getVariableCount()]SymbolId.VariableId = undefined;
@@ -544,7 +551,7 @@ pub fn Grammar(comptime Variable: type, comptime Terminal: type) type {
                 var visited_buffer: [self.getVariableCount()]bool = undefined;
 
                 self.computeFirstSet(
-                    utils.Slice2d([]bool).init(&first_set_buffer, self.getTerminalCount()),
+                    utils.Slice2d([]bool).init(&first_set_buffer, self.getSymbolCount()),
                     &first_var_edge_list_offsets_buffer,
                     &populated_buffer,
                     &path_buffer,
@@ -568,7 +575,7 @@ pub fn Grammar(comptime Variable: type, comptime Terminal: type) type {
             first_set: utils.Slice2d([]const bool),
         ) void {
             std.debug.assert(follow_set.slice.len >= self.getVariableCount() * self.getTerminalCount());
-            std.debug.assert(first_set.slice.len >= self.getVariableCount() * self.getTerminalCount());
+            std.debug.assert(first_set.slice.len >= self.getVariableCount() * self.getSymbolCount());
 
             @memset(follow_set.slice, false);
 
@@ -576,7 +583,7 @@ pub fn Grammar(comptime Variable: type, comptime Terminal: type) type {
             follow_set.row(0)[follow_set.row_length - 1] = true;
 
             // Iterate through each rhs of each grammar rule. Whenever we come
-            // across, a variable, look at the next symbol: if its a terminal,
+            // across a variable, look at the next symbol: if its a terminal,
             // add it to the variable's FOLLOW set; if it's another variable,
             // union its FIRST set into the current variable's FOLLOW set.
             for (self.rules) |rule| {
@@ -585,7 +592,7 @@ pub fn Grammar(comptime Variable: type, comptime Terminal: type) type {
                         .terminal_id => continue,
                         .variable_id => |v_id| switch (next_symbol_id) {
                             .terminal_id => |next_t_id| follow_set.row(v_id)[next_t_id] = true,
-                            .variable_id => |next_v_id| utils.sliceUnion(follow_set.row(v_id), first_set.row(next_v_id)),
+                            .variable_id => |next_v_id| utils.sliceUnion(follow_set.row(v_id), first_set.row(next_v_id)[0..self.getTerminalCount()]),
                         }
                     }
                 }
@@ -615,7 +622,7 @@ pub fn Grammar(comptime Variable: type, comptime Terminal: type) type {
         ///       symbol ID (0). FOLLOW(S') will be initialized to {$}, which
         ///       will then be propogated as needed.
         pub fn getFollowSet(self: Self, allocator: std.mem.Allocator) ![]bool {
-            const first_set_buffer = try allocator.alloc(bool, self.getVariableCount() * self.getTerminalCount());
+            const first_set_buffer = try allocator.alloc(bool, self.getVariableCount() * self.getSymbolCount());
             defer allocator.free(first_set_buffer);
             const first_var_edge_list_offsets_buffer = try allocator.alloc(usize, self.getVariableCount() + 1);
             defer allocator.free(first_var_edge_list_offsets_buffer);
@@ -629,7 +636,7 @@ pub fn Grammar(comptime Variable: type, comptime Terminal: type) type {
             defer allocator.free(visited_buffer);
 
             self.computeFirstSet(
-                utils.Slice2d([]bool).init(first_set_buffer, self.getTerminalCount()),
+                utils.Slice2d([]bool).init(first_set_buffer, self.getSymbolCount()),
                 first_var_edge_list_offsets_buffer,
                 populated_buffer,
                 path_buffer,
@@ -642,7 +649,7 @@ pub fn Grammar(comptime Variable: type, comptime Terminal: type) type {
 
             self.computeFollowSet(
                 utils.Slice2d([]bool).init(follow_set_buffer, self.getTerminalCount()),
-                utils.Slice2d([]const bool).init(first_set_buffer, self.getTerminalCount()),
+                utils.Slice2d([]const bool).init(first_set_buffer, self.getSymbolCount()),
             );
             return follow_set_buffer;
         }
@@ -650,7 +657,7 @@ pub fn Grammar(comptime Variable: type, comptime Terminal: type) type {
         /// Comptime version of `getFollowSet()`, no dynamic allocation needed.
         pub fn getFollowSetComptime(comptime self: Self) [self.getVariableCount() * self.getTerminalCount()]bool {
             comptime {
-                var first_set_buffer: [self.getVariableCount() * self.getTerminalCount()]bool = undefined;
+                var first_set_buffer: [self.getVariableCount() * self.getSymbolCount()]bool = undefined;
                 var first_var_edge_list_offsets_buffer: [self.getVariableCount() + 1]usize = undefined;
                 var populated_buffer: [self.getVariableCount()]bool = undefined;
                 var path_buffer: [self.getVariableCount()]SymbolId.VariableId = undefined;
@@ -658,7 +665,7 @@ pub fn Grammar(comptime Variable: type, comptime Terminal: type) type {
                 var visited_buffer: [self.getVariableCount()]bool = undefined;
 
                 self.computeFirstSet(
-                    utils.Slice2d([]bool).init(&first_set_buffer, self.getTerminalCount()),
+                    utils.Slice2d([]bool).init(&first_set_buffer, self.getSymbolCount()),
                     &first_var_edge_list_offsets_buffer,
                     &populated_buffer,
                     &path_buffer,
@@ -670,7 +677,7 @@ pub fn Grammar(comptime Variable: type, comptime Terminal: type) type {
 
                 self.computeFollowSet(
                     utils.Slice2d([]bool).init(&follow_set_buffer, self.getTerminalCount()),
-                    utils.Slice2d([]const bool).init(&first_set_buffer, self.getTerminalCount()),
+                    utils.Slice2d([]const bool).init(&first_set_buffer, self.getSymbolCount()),
                 );
                 return follow_set_buffer;
             }
@@ -843,8 +850,8 @@ test "firsts_and_follows [grammar1.0]" {
     const first_set_comptime = comptime grammar.getFirstSetComptime();
 
     const expected_firsts = [_]bool{
-        true, true, true, false, false, false, false, false, false,
-        true, true, true, false, false, false, false, false, false,
+        true, true, true, false, false, false, false, false, false, false, true,
+        true, true, true, false, false, false, false, false, false, false, false
     };
 
     try std.testing.expectEqualSlices(bool, &expected_firsts, first_set);
@@ -917,12 +924,12 @@ test "firsts_and_follows [grammar2.2]" {
     const first_set_comptime = comptime grammar.getFirstSetComptime();
 
     const expected_firsts = [_]bool{
-        false, false, false, false, true,  true, false, true, false,
-        false, false, false, false, true,  true, false, true, false,
-        false, false, false, false, true,  true, false, true, false,
-        false, false, false, false, true,  true, false, true, false,
-        false, false, false, false, true,  true, false, true, false,
-        false, false, false, false, false, true, false, true, false,
+        false, false, false, false, true,  true, false, true, false, false, true,  true,  true,  true,  true,
+        false, false, false, false, true,  true, false, true, false, false, true,  true,  true,  true,  true,
+        false, false, false, false, true,  true, false, true, false, false, false, true,  true,  true,  true,
+        false, false, false, false, true,  true, false, true, false, false, false, false, true,  true,  true,
+        false, false, false, false, true,  true, false, true, false, false, false, false, false, false, true,
+        false, false, false, false, false, true, false, true, false, false, false, false, false, false, false,
     };
     try std.testing.expectEqualSlices(bool, &expected_firsts, first_set);
     try std.testing.expectEqualSlices(bool, &expected_firsts, &first_set_comptime);
@@ -944,15 +951,15 @@ test "firsts_and_follows [grammar2.2]" {
     try std.testing.expectEqualSlices(bool, &expected_follow, &follow_set_comptime);
 }
 
-fn tableFromTuples(
+fn followTableFromTuples(
     comptime tuples: anytype,
     comptime Variable: type,
     comptime Terminal: type,
     grammar: Grammar(Variable, Terminal),
 ) [grammar.getVariableCount() * grammar.getTerminalCount()]bool {
     comptime {
-        var first_set = [_]bool {false} ** (grammar.getVariableCount() * grammar.getTerminalCount());
-        var first_set_2d_view = utils.Slice2d([]bool).init(&first_set, grammar.getTerminalCount());
+        var follow_set = [_]bool {false} ** (grammar.getVariableCount() * grammar.getTerminalCount());
+        var follow_set_2d_view = utils.Slice2d([]bool).init(&follow_set, grammar.getTerminalCount());
 
         for (tuples) |tuple| {
             const variable = tuple.@"0";
@@ -961,13 +968,44 @@ fn tableFromTuples(
             const terminals = tuple.@"1";
             for (std.meta.fieldNames(@TypeOf(terminals))) |rhs_tuple_field_name| {
                 const terminal = @field(terminals, rhs_tuple_field_name);
-                if (@TypeOf(terminal) != Terminal) {
+                if (@TypeOf(terminal) == Terminal) {
+                    const t_id = grammar.getSymbolIdFromTerminal(terminal).?.terminal_id;
+                    follow_set_2d_view.row(v_id)[t_id] = true;
+                } else {
                     @compileError("rhs of tuple must only contain Terminals");
                 }
+            }
+        }
+        return follow_set;
+    }
+}
 
-                const t_id = grammar.getSymbolIdFromTerminal(terminal).?.terminal_id;
+fn firstTableFromTuples(
+    comptime tuples: anytype,
+    comptime Variable: type,
+    comptime Terminal: type,
+    grammar: Grammar(Variable, Terminal),
+) [grammar.getVariableCount() * grammar.getSymbolCount()]bool {
+    comptime {
+        var first_set = [_]bool {false} ** (grammar.getVariableCount() * grammar.getSymbolCount());
+        var first_set_2d_view = utils.Slice2d([]bool).init(&first_set, grammar.getSymbolCount());
 
-                first_set_2d_view.row(v_id)[t_id] = true;
+        for (tuples) |tuple| {
+            const variable = tuple.@"0";
+            const v_id = grammar.getSymbolIdFromVariable(variable).?.variable_id;
+
+            const terminals = tuple.@"1";
+            for (std.meta.fieldNames(@TypeOf(terminals))) |rhs_tuple_field_name| {
+                const terminal = @field(terminals, rhs_tuple_field_name);
+                if (@TypeOf(terminal) == Terminal) {
+                    const t_id = grammar.getSymbolIdFromTerminal(terminal).?.terminal_id;
+                    first_set_2d_view.row(v_id)[t_id] = true;
+                } else if (@TypeOf(terminal) == Variable) {
+                    const other_v_id = grammar.getSymbolIdFromVariable(terminal).?.variable_id;
+                    first_set_2d_view.row(v_id)[grammar.getTerminalCount() + other_v_id] = true;
+                } else {
+                    @compileError("rhs of tuple must only contain Terminals and Variables");
+                }
             }
         }
         return first_set;
@@ -1003,15 +1041,16 @@ test "first_and_follows [custom1]" {
 
     const first_set_comptime = comptime grammar.getFirstSetComptime();
 
-    const expected_first_set = comptime tableFromTuples(
+    const expected_first_set = comptime firstTableFromTuples(
         .{
-            .{ V("S"), .{ T("("), T("#"), T("~") } },
-            .{ V("A"), .{ T("("), T("#"), T("~") } },
+            .{ V("S"), .{ T("("), T("#"), T("~"), V("A"), V("B") } },
+            .{ V("A"), .{ T("("), T("#"), T("~"), V("B") } },
             .{ V("B"), .{ T("("), T("#") } },
         },
         TestVariable,
         TestTerminal,
-        grammar
+        grammar,
+
     );
 
     try std.testing.expectEqualSlices(bool, &expected_first_set, first_set);
@@ -1053,12 +1092,12 @@ test "first_and_follows [custom2]" {
 
     const first_set_comptime = comptime grammar.getFirstSetComptime();
 
-    const expected_first_set = comptime tableFromTuples(
+    const expected_first_set = comptime firstTableFromTuples(
         .{
-            .{ V("S"), .{ T("c"), T("a") } },
+            .{ V("S"), .{ T("c"), T("a"), V("A") } },
             .{ V("A"), .{ T("c"), T("a") } },
-            .{ V("B"), .{ T("c"), T("a"), T("q") } },
-            .{ V("C"), .{ T("c"), T("a"), T("q") } },
+            .{ V("B"), .{ T("c"), T("a"), T("q"), V("C"), V("D"), V("A") } },
+            .{ V("C"), .{ T("c"), T("a"), T("q"), V("D"), V("A") } },
             .{ V("D"), .{ T("q") } },
         },
         TestVariable,
@@ -1107,11 +1146,11 @@ test "first_and_follows [custom3]" {
 
     const first_set_comptime = comptime grammar.getFirstSetComptime();
 
-    const expected_first_set = comptime tableFromTuples(.{
-        .{ V("S"), .{ T("c"), T("a"), T("z") } },
-        .{ V("A"), .{ T("c"), T("a"), T("z") } },
-        .{ V("B"), .{ T("c"), T("a"), T("z"), T("q") } },
-        .{ V("C"), .{ T("c"), T("a"), T("z"), T("q") } },
+    const expected_first_set = comptime firstTableFromTuples(.{
+        .{ V("S"), .{ T("c"), T("a"), T("z"), V("A"), V("Q") } },
+        .{ V("A"), .{ T("c"), T("a"), T("z"), V("Q") } },
+        .{ V("B"), .{ T("c"), T("a"), T("z"), T("q"), V("C"), V("A"), V("D"), V("Q")} },
+        .{ V("C"), .{ T("c"), T("a"), T("z"), T("q"), V("A"), V("D"), V("Q") } },
         .{ V("D"), .{T("q")} },
         .{ V("Q"), .{T("z")} },
     }, TestVariable, TestTerminal, grammar);
@@ -1156,13 +1195,11 @@ test "first_and_follows [custom4]" {
 
     const first_set_comptime = comptime grammar.getFirstSetComptime();
 
-    const expected_first_set = comptime tableFromTuples(.{
-        .{ V("S"), .{ T("a"), T("z") } },
-        .{ V("A"), .{ T("a"), T("z") } },
-        .{ V("S"), .{ T("c"), T("a"), T("z") } },
-        .{ V("A"), .{ T("c"), T("a"), T("z") } },
-        .{ V("B"), .{ T("c"), T("a"), T("z"), T("q") } },
-        .{ V("C"), .{ T("c"), T("a"), T("z"), T("q") } },
+    const expected_first_set = comptime firstTableFromTuples(.{
+        .{ V("S"), .{ T("c"), T("a"), T("z"), V("A"), V("Q") } },
+        .{ V("A"), .{ T("c"), T("a"), T("z"), V("Q") } },
+        .{ V("B"), .{ T("c"), T("a"), T("z"), T("q"), V("C"), V("A"), V("Q"), V("D") } },
+        .{ V("C"), .{ T("c"), T("a"), T("z"), T("q"), V("A"), V("Q"), V("D") } },
         .{ V("D"), .{T("q")} },
         .{ V("Q"), .{T("z")} },
     }, TestVariable, TestTerminal, grammar);
