@@ -621,63 +621,25 @@ pub fn Grammar(comptime Variable: type, comptime Terminal: type) type {
         /// NOTE: Assumes $ is last terminal symbol ID and S' is the first
         ///       symbol ID (0). FOLLOW(S') will be initialized to {$}, which
         ///       will then be propogated as needed.
-        pub fn getFollowSet(self: Self, allocator: std.mem.Allocator) ![]bool {
-            const first_set_buffer = try allocator.alloc(bool, self.getVariableCount() * self.getSymbolCount());
-            defer allocator.free(first_set_buffer);
-            const first_var_edge_list_offsets_buffer = try allocator.alloc(usize, self.getVariableCount() + 1);
-            defer allocator.free(first_var_edge_list_offsets_buffer);
-            const populated_buffer = try allocator.alloc(bool, self.getVariableCount());
-            defer allocator.free(populated_buffer);
-            const path_buffer = try allocator.alloc(SymbolId.VariableId, self.getVariableCount());
-            defer allocator.free(path_buffer);
-            const path_edges_explored_buffer = try allocator.alloc(usize, self.getVariableCount());
-            defer allocator.free(path_edges_explored_buffer);
-            const visited_buffer = try allocator.alloc(bool, self.getVariableCount());
-            defer allocator.free(visited_buffer);
-
-            self.computeFirstSet(
-                utils.Slice2d([]bool).init(first_set_buffer, self.getSymbolCount()),
-                first_var_edge_list_offsets_buffer,
-                populated_buffer,
-                path_buffer,
-                path_edges_explored_buffer,
-                visited_buffer,
-            );
-
+        pub fn getFollowSet(self: Self, allocator: std.mem.Allocator, first_set: utils.Slice2d([]const bool)) ![]bool {
             const follow_set_buffer = try allocator.alloc(bool, self.getVariableCount() * self.getTerminalCount());
             errdefer allocator.free(follow_set_buffer);
 
             self.computeFollowSet(
                 utils.Slice2d([]bool).init(follow_set_buffer, self.getTerminalCount()),
-                utils.Slice2d([]const bool).init(first_set_buffer, self.getSymbolCount()),
+                first_set,
             );
             return follow_set_buffer;
         }
 
         /// Comptime version of `getFollowSet()`, no dynamic allocation needed.
-        pub fn getFollowSetComptime(comptime self: Self) [self.getVariableCount() * self.getTerminalCount()]bool {
+        pub fn getFollowSetComptime(comptime self: Self, first_set: utils.Slice2d([]const bool)) [self.getVariableCount() * self.getTerminalCount()]bool {
             comptime {
-                var first_set_buffer: [self.getVariableCount() * self.getSymbolCount()]bool = undefined;
-                var first_var_edge_list_offsets_buffer: [self.getVariableCount() + 1]usize = undefined;
-                var populated_buffer: [self.getVariableCount()]bool = undefined;
-                var path_buffer: [self.getVariableCount()]SymbolId.VariableId = undefined;
-                var path_edges_explored_buffer: [self.getVariableCount()]usize = undefined;
-                var visited_buffer: [self.getVariableCount()]bool = undefined;
-
-                self.computeFirstSet(
-                    utils.Slice2d([]bool).init(&first_set_buffer, self.getSymbolCount()),
-                    &first_var_edge_list_offsets_buffer,
-                    &populated_buffer,
-                    &path_buffer,
-                    &path_edges_explored_buffer,
-                    &visited_buffer,
-                );
-
                 var follow_set_buffer: [self.getVariableCount() * self.getTerminalCount()]bool = undefined;
 
                 self.computeFollowSet(
                     utils.Slice2d([]bool).init(&follow_set_buffer, self.getTerminalCount()),
-                    utils.Slice2d([]const bool).init(&first_set_buffer, self.getSymbolCount()),
+                    first_set,
                 );
                 return follow_set_buffer;
             }
@@ -857,10 +819,15 @@ test "firsts_and_follows [grammar1.0]" {
     try std.testing.expectEqualSlices(bool, &expected_firsts, first_set);
     try std.testing.expectEqualSlices(bool, &expected_firsts, &first_set_comptime);
 
-    const follow_set = try grammar.getFollowSet(allocator);
+    const follow_set = try grammar.getFollowSet(
+        allocator,
+        utils.Slice2d([]const bool).init(first_set, grammar.getSymbolCount())
+    );
     defer allocator.free(follow_set);
 
-    const follow_set_comptime = comptime grammar.getFollowSetComptime();
+    const follow_set_comptime = comptime grammar.getFollowSetComptime(
+        utils.Slice2d([]const bool).init(first_set_comptime, grammar.getSymbolCount())
+    );
 
     const expected_follow = [_]bool{
         false, false, false, false, false, false, false, false, true,
@@ -934,10 +901,15 @@ test "firsts_and_follows [grammar2.2]" {
     try std.testing.expectEqualSlices(bool, &expected_firsts, first_set);
     try std.testing.expectEqualSlices(bool, &expected_firsts, &first_set_comptime);
 
-    const follow_set = try grammar.getFollowSet(allocator);
+    const follow_set = try grammar.getFollowSet(
+        allocator,
+        utils.Slice2d([]const bool).init(first_set, grammar.getSymbolCount())
+    );
     defer allocator.free(follow_set);
 
-    const follow_set_comptime = comptime grammar.getFollowSetComptime();
+    const follow_set_comptime = comptime grammar.getFollowSetComptime(
+        utils.Slice2d([]const bool).init(first_set_comptime, grammar.getSymbolCount())
+    );
 
     const expected_follow = [_]bool{
         false, false, false, false, false, false, false, false, true,
