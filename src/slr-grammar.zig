@@ -1,5 +1,6 @@
 const std = @import("std");
 
+const comptime_allocator = @import("comptime-allocator.zig");
 const test_common = @import("test-common.zig");
 const utils = @import("utils.zig");
 
@@ -312,35 +313,26 @@ pub fn Grammar(comptime Variable: type, comptime Terminal: type) type {
             return self.rules[rule_id];
         }
 
-        /// Caller must provide buffers with the necessary room:
-        /// * `first_set_table.slice: [self.getVariableCount() * self.getSymbolCount()]`
-        /// * `first_var_edge_list_offsets: [self.getVariableCount() + 1]`
-        /// * `populated: [self.getVariableCount()]`
-        /// * `path: [self.getVariableCount()]`
-        /// * `path_edges_explored: [self.getVariableCount()]`
-        /// * `visited: [self.getVariableCount()]`
-        ///
-        /// `first_set_table` is populated with the resulting table, the other
-        /// buffers can be freed immediately if they were dynamically allocated.
+        /// Caller must free the returned slice.
         fn computeFirstSet(
             self: Self,
-            first_set_table: utils.Slice2d([]bool),
-            first_var_edge_list_offsets: []usize,
-            populated: []bool,
-            path: []SymbolId.VariableId,
-            path_edges_explored: []usize,
-            visited: []bool,
-        ) void {
-            std.debug.assert(first_set_table.slice.len == self.getVariableCount() * self.getSymbolCount());
-            std.debug.assert(first_var_edge_list_offsets.len == self.getVariableCount() + 1);
-            std.debug.assert(populated.len == self.getVariableCount());
-            std.debug.assert(path.len == self.getVariableCount());
-            std.debug.assert(path_edges_explored.len == self.getVariableCount());
-            std.debug.assert(visited.len == self.getVariableCount());
-
+            allocator: std.mem.Allocator,
+        ) ![]bool {
+            var first_set_table = utils.Slice2d([]bool).init(
+                try allocator.alloc(
+                    bool,
+                    self.getVariableCount() * self.getSymbolCount(),
+                ),
+                self.getSymbolCount(),
+            );
             @memset(first_set_table.slice, false);
+
+            var first_var_edge_list_offsets = try allocator.alloc(
+                usize,
+                self.getVariableCount() + 1,
+            );
+            defer allocator.free(first_var_edge_list_offsets);
             @memset(first_var_edge_list_offsets, 0);
-            @memset(populated, false);
 
             // In this function, we want to think about our rules as a
             // directional graph. Each node represents a variable, and an edge
@@ -440,9 +432,23 @@ pub fn Grammar(comptime Variable: type, comptime Terminal: type) type {
             //   infinite loops).
             // After all of the traversals are done, first_set_table will be
             // fully propagated / populated.
+
+            var path = std.ArrayList(SymbolId.VariableId).empty;
+            defer path.deinit(allocator);
+
+            var path_edges_explored = try allocator.alloc(usize, self.getVariableCount());
+            defer allocator.free(path_edges_explored);
+
+            var visited = try allocator.alloc(bool, self.getVariableCount());
+            defer allocator.free(visited);
+
+            var populated = try allocator.alloc(bool, self.getVariableCount());
+            defer allocator.free(populated);
+            @memset(populated, false);
+
             for (0..self.getVariableCount()) |start_node| {
-                var path_len: SymbolId.VariableId = 1;
-                path[0] = @intCast(start_node);
+                path.items.len = 0;
+                try path.append(allocator, @intCast(start_node));
 
                 // Used to track how many edges we have already explored from
                 // each node along the path.
@@ -453,9 +459,8 @@ pub fn Grammar(comptime Variable: type, comptime Terminal: type) type {
 
                 // Perform a depth first traversal from the start node.
                 var state: enum { backtracking, exploring } = .exploring;
-                while (path_len > 0) switch (state) {
+                while (path.getLastOrNull()) |current_node| switch (state) {
                     .exploring => {
-                        const current_node = path[path_len - 1];
                         const edges_explored = path_edges_explored[current_node];
                         const edge_count = first_var_edge_list_offsets[@as(usize, current_node) + 1] - first_var_edge_list_offsets[current_node];
 
@@ -472,8 +477,7 @@ pub fn Grammar(comptime Variable: type, comptime Terminal: type) type {
 
                             // Continue exploring.
                             visited[next_node] = true;
-                            path[path_len] = next_node;
-                            path_len += 1;
+                            try path.append(allocator, next_node);
 
                             // Unless we've already explored this path.
                             if (populated[next_node]) {
@@ -488,11 +492,10 @@ pub fn Grammar(comptime Variable: type, comptime Terminal: type) type {
                     .backtracking => {
                         // Before we backtrack, copy terminals from the current
                         // node into the starting node.
-                        const current_node = path[path_len - 1];
                         utils.rowUnion(first_set_table, start_node, current_node);
 
                         // Then move back one node and keep exploring.
-                        path_len -= 1;
+                        path.items.len -= 1;
                         state = .exploring;
                     },
                 };
@@ -500,6 +503,8 @@ pub fn Grammar(comptime Variable: type, comptime Terminal: type) type {
                 // The FIRST set for this node is now fully populated.
                 populated[start_node] = true;
             }
+
+            return first_set_table.slice;
         }
 
         /// Computes the FIRST set for the grammar as a table. Each row
@@ -516,50 +521,12 @@ pub fn Grammar(comptime Variable: type, comptime Terminal: type) type {
         ///
         /// NOTE: $ (END character) can never be first
         pub fn getFirstSet(self: Self, allocator: std.mem.Allocator) ![]bool {
-            const first_set_buffer = try allocator.alloc(bool, self.getVariableCount() * self.getSymbolCount());
-            errdefer allocator.free(first_set_buffer);
-            const first_var_edge_list_offsets_buffer = try allocator.alloc(usize, self.getVariableCount() + 1);
-            defer allocator.free(first_var_edge_list_offsets_buffer);
-            const populated_buffer = try allocator.alloc(bool, self.getVariableCount());
-            defer allocator.free(populated_buffer);
-            const path_buffer = try allocator.alloc(SymbolId.VariableId, self.getVariableCount());
-            defer allocator.free(path_buffer);
-            const path_edges_explored_buffer = try allocator.alloc(usize, self.getVariableCount());
-            defer allocator.free(path_edges_explored_buffer);
-            const visited_buffer = try allocator.alloc(bool, self.getVariableCount());
-            defer allocator.free(visited_buffer);
-
-            self.computeFirstSet(
-                utils.Slice2d([]bool).init(first_set_buffer, self.getSymbolCount()),
-                first_var_edge_list_offsets_buffer,
-                populated_buffer,
-                path_buffer,
-                path_edges_explored_buffer,
-                visited_buffer,
-            );
-            return first_set_buffer;
+            return self.computeFirstSet(allocator);
         }
 
         /// Comptime version of `getFirstSet()`, no dynamic allocation needed.
-        pub fn getFirstSetComptime(comptime self: Self) [self.getVariableCount() * self.getSymbolCount()]bool {
-            comptime {
-                var first_set_buffer: [self.getVariableCount() * self.getSymbolCount()]bool = undefined;
-                var first_var_edge_list_offsets_buffer: [self.getVariableCount() + 1]usize = undefined;
-                var populated_buffer: [self.getVariableCount()]bool = undefined;
-                var path_buffer: [self.getVariableCount()]SymbolId.VariableId = undefined;
-                var path_edges_explored_buffer: [self.getVariableCount()]usize = undefined;
-                var visited_buffer: [self.getVariableCount()]bool = undefined;
-
-                self.computeFirstSet(
-                    utils.Slice2d([]bool).init(&first_set_buffer, self.getSymbolCount()),
-                    &first_var_edge_list_offsets_buffer,
-                    &populated_buffer,
-                    &path_buffer,
-                    &path_edges_explored_buffer,
-                    &visited_buffer,
-                );
-                return first_set_buffer;
-            }
+        pub fn getFirstSetComptime(comptime self: Self) []bool {
+            comptime return self.computeFirstSet(comptime_allocator.comptime_allocator) catch unreachable;
         }
 
         /// Caller must provide buffers with the necessary room:
@@ -817,7 +784,7 @@ test "firsts_and_follows [grammar1.0]" {
     };
 
     try std.testing.expectEqualSlices(bool, &expected_firsts, first_set);
-    try std.testing.expectEqualSlices(bool, &expected_firsts, &first_set_comptime);
+    comptime try std.testing.expectEqualSlices(bool, &expected_firsts, first_set_comptime);
 
     const follow_set = try grammar.getFollowSet(
         allocator,
@@ -899,7 +866,7 @@ test "firsts_and_follows [grammar2.2]" {
         false, false, false, false, false, true, false, true, false, false, false, false, false, false, false,
     };
     try std.testing.expectEqualSlices(bool, &expected_firsts, first_set);
-    try std.testing.expectEqualSlices(bool, &expected_firsts, &first_set_comptime);
+    comptime try std.testing.expectEqualSlices(bool, &expected_firsts, first_set_comptime);
 
     const follow_set = try grammar.getFollowSet(
         allocator,
@@ -1026,7 +993,7 @@ test "first_and_follows [custom1]" {
     );
 
     try std.testing.expectEqualSlices(bool, &expected_first_set, first_set);
-    try std.testing.expectEqualSlices(bool, &expected_first_set, &first_set_comptime);
+    comptime try std.testing.expectEqualSlices(bool, &expected_first_set, first_set_comptime);
 }
 
 test "first_and_follows [custom2]" {
@@ -1078,7 +1045,7 @@ test "first_and_follows [custom2]" {
     );
 
     try std.testing.expectEqualSlices(bool, &expected_first_set, first_set);
-    try std.testing.expectEqualSlices(bool, &expected_first_set, &first_set_comptime);
+    comptime try std.testing.expectEqualSlices(bool, &expected_first_set, first_set_comptime);
 }
 
 test "first_and_follows [custom3]" {
@@ -1128,7 +1095,7 @@ test "first_and_follows [custom3]" {
     }, TestVariable, TestTerminal, grammar);
 
     try std.testing.expectEqualSlices(bool, &expected_first_set, first_set);
-    try std.testing.expectEqualSlices(bool, &expected_first_set, &first_set_comptime);
+    comptime try std.testing.expectEqualSlices(bool, &expected_first_set, first_set_comptime);
 }
 
 test "first_and_follows [custom4]" {
@@ -1177,5 +1144,5 @@ test "first_and_follows [custom4]" {
     }, TestVariable, TestTerminal, grammar);
 
     try std.testing.expectEqualSlices(bool, &expected_first_set, first_set);
-    try std.testing.expectEqualSlices(bool, &expected_first_set, &first_set_comptime);
+    comptime try std.testing.expectEqualSlices(bool, &expected_first_set, first_set_comptime);
 }
