@@ -1,5 +1,40 @@
 const std = @import("std");
 
+pub fn RaggedArray(comptime T: type) type {
+    return struct {
+        const Self = @This();
+
+        data: [] T,
+        offsets: []const usize,
+
+        pub fn init(data: [] T, offsets: []const usize) Self {
+            std.debug.assert(offsets[offsets.len - 1] == data.len);
+
+            return Self {
+                .data = data,
+                .offsets = offsets,
+            };
+        }
+
+        pub fn deinit(self: Self, allocator: std.mem.Allocator) void {
+            allocator.free(self.data);
+            allocator.free(self.offsets);
+        }
+
+        pub fn row(self: Self, r: usize) [] T {
+            std.debug.assert(r < self.offsets.len - 1);
+
+            const row_start = self.offsets[r];
+            const row_end = self.offsets[r + 1];
+            return self.data[row_start..row_end];
+        }
+
+        pub fn getRowCount(self: Self) usize {
+            return self.offsets.len - 1;
+        }
+    };
+}
+
 pub fn Slice2d(comptime SliceType: type) type {
     comptime {
         const info = @typeInfo(SliceType);

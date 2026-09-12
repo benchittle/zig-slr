@@ -99,6 +99,7 @@ pub const Production = struct {
 pub fn Grammar(comptime Variable: type, comptime Terminal: type) type {
     return struct {
         const Self = @This();
+        const NfaState = usize;
 
         rules: []const Production,
         state_count: usize,
@@ -322,20 +323,11 @@ pub fn Grammar(comptime Variable: type, comptime Terminal: type) type {
             return self.rules[rule_id];
         }
 
-        /// Caller must free the returned slice.
-        fn computeFirstSet(
+        /// Caller must free returned RaggedArray
+        fn computeEpsilonClosures(
             self: Self,
             allocator: std.mem.Allocator,
-        ) ![]bool {
-            var first_set_table = utils.Slice2d([]bool).init(
-                try allocator.alloc(
-                    bool,
-                    self.getVariableCount() * self.getSymbolCount(),
-                ),
-                self.getSymbolCount(),
-            );
-            @memset(first_set_table.slice, false);
-
+        ) !utils.RaggedArray(NfaState) {
             var first_var_edge_list_offsets = try allocator.alloc(
                 usize,
                 self.getVariableCount() + 1,
@@ -348,7 +340,7 @@ pub fn Grammar(comptime Variable: type, comptime Terminal: type) type {
             // from nodes A to B exists if there is a grammar rule where
             // variable A produces symbol B as the first symbol.
             //
-            // NOTE: From here on, grammar variables will be referred to as
+            // NOTE: From here on, grammar symbols will be referred to as
             //       nodes in comments and variable names.
             //
             // The graph is represented using a pseudo compressed sparse row
@@ -414,47 +406,52 @@ pub fn Grammar(comptime Variable: type, comptime Terminal: type) type {
                 }
             }
 
-            // Initialize first_set_table with symbols that appear as the
-            // first symbol on the right side of a production. We will propagate
-            // these in the next step.
-            // First do variables.
-            for (self.rules[0..total_edge_count]) |rule| {
-                const var_id = rule.lhs;
-                const first_rule_symbol_id = rule.rhs[0].variable_id;
-                first_set_table.row(var_id)[self.getTerminalCount() + first_rule_symbol_id] = true;
-            }
-            // Then do terminals.
-            for (self.rules[total_edge_count..]) |rule| {
-                const var_id = rule.lhs;
-                const first_rule_symbol_id = rule.rhs[0].terminal_id;
-                first_set_table.row(var_id)[first_rule_symbol_id] = true;
+            // Maps each grammar rule to the first e-NFA state of its RHS.
+            var rule_first_state_map = try allocator.alloc(NfaState, self.rules.len);
+            defer allocator.free(rule_first_state_map);
+            rule_first_state_map[0] = 0;
+            for (1..self.rules.len) |i| {
+                const previous_rule_last_state = rule_first_state_map[i - 1] + self.rules[i - 1].rhs.len;
+                rule_first_state_map[i] = previous_rule_last_state + 1;
             }
 
-            // Now to solve the actual problem at hand: computing the FIRST set.
-            // - Starting from each node, we traverse the graph (depth first)
-            //   copying the terminal symbols from each node (variable) that is
-            //   reachable, and then mark the starting node as populated.
-            // - If we come across a node that is already populated, we don't
-            //   explore that path any farther, and instead just copy its
-            //   terminals.
-            // - We avoid visiting the same node twice in a path (to avoid
-            //   infinite loops).
-            // After all of the traversals are done, first_set_table will be
-            // fully propagated / populated.
+            // Stores the e-NFA states reachable when reading a given grammar
+            // variable. Each row represents a grammar variable, and each column
+            // represents an e-NFA state (only the states stored in
+            // rule_first_state_map are considered).
+            var closure_table = utils.Slice2d([]bool).init(
+                try allocator.alloc(bool, self.getVariableCount() * self.rules.len),
+                self.rules.len,
+            );
+            defer allocator.free(closure_table.slice);
+            @memset(closure_table.slice, false);
+
+            // Seed first_closure_table with the state(s) directly reachable
+            // from each grammar variable.
+            for (self.rules, 0..) |rule, i| {
+                closure_table.row(rule.lhs)[i] = true;
+            }
 
             var path = std.ArrayList(SymbolId.VariableId).empty;
             defer path.deinit(allocator);
-
             var path_edges_explored = try allocator.alloc(usize, self.getVariableCount());
             defer allocator.free(path_edges_explored);
-
             var visited = try allocator.alloc(bool, self.getVariableCount());
             defer allocator.free(visited);
-
             var populated = try allocator.alloc(bool, self.getVariableCount());
             defer allocator.free(populated);
             @memset(populated, false);
 
+            // Now to solve the actual problem at hand: computing the epsilon
+            // closure for each grammar variable.
+            // - Starting from each node, we traverse the graph (depth first)
+            //   copying the closure states from each node that is reachable,
+            //   and then mark the starting node as populated.
+            // - If we come across a node that is already populated, we don't
+            //   explore that path any farther, and instead just copy its
+            //   closure.
+            // - We avoid visiting the same node twice in a path (to avoid
+            //   infinite loops).
             for (0..self.getVariableCount()) |start_node| {
                 path.items.len = 0;
                 try path.append(allocator, @intCast(start_node));
@@ -499,9 +496,9 @@ pub fn Grammar(comptime Variable: type, comptime Terminal: type) type {
                         }
                     },
                     .backtracking => {
-                        // Before we backtrack, copy terminals from the current
-                        // node into the starting node.
-                        utils.rowUnion(first_set_table, start_node, current_node);
+                        // Before we backtrack, copy reachable states from the
+                        // current node into the starting node.
+                        utils.rowUnion(closure_table, start_node, current_node);
 
                         // Then move back one node and keep exploring.
                         path.items.len -= 1;
@@ -509,8 +506,91 @@ pub fn Grammar(comptime Variable: type, comptime Terminal: type) type {
                     },
                 };
 
-                // The FIRST set for this node is now fully populated.
+                // The set of reachable states for this node is now fully
+                // populated.
                 populated[start_node] = true;
+            }
+
+            // Convert closure_table to a ragged array. //
+
+            // First determine the row offsets and total length for the ragged
+            // array.
+            var closure_lists_offsets = try allocator.alloc(usize, self.getVariableCount() + 1);
+            errdefer allocator.free(closure_lists_offsets);
+            closure_lists_offsets[0] = 0;
+            for (0..self.getVariableCount()) |var_id| {
+                closure_lists_offsets[var_id + 1] = closure_lists_offsets[var_id];
+                for (closure_table.row(var_id)) |is_in_closure| {
+                    if (is_in_closure) {
+                        closure_lists_offsets[var_id + 1] += 1;
+                    }
+                }
+            }
+
+            var closure_lists = utils.RaggedArray(NfaState).init(
+                try allocator.alloc(
+                    NfaState,
+                    closure_lists_offsets[closure_lists_offsets.len - 1],
+                ),
+                closure_lists_offsets,
+            );
+            errdefer allocator.free(closure_lists.data);
+
+            // Populate the ragged array.
+            for (0..self.getVariableCount()) |var_id| {
+                var count: usize = 0;
+                for (closure_table.row(var_id), 0..) |is_in_closure, rule_id| {
+                    if (is_in_closure) {
+                        closure_lists.row(var_id)[count] = rule_first_state_map[rule_id];
+                        count += 1;
+                    }
+                }
+            }
+
+            return closure_lists;
+        }
+
+        /// Caller must free the returned slice.
+        fn computeFirstSet(
+            self: Self,
+            allocator: std.mem.Allocator,
+        ) ![]bool {
+            var first_set_table = utils.Slice2d([]bool).init(
+                try allocator.alloc(
+                    bool,
+                    self.getVariableCount() * self.getSymbolCount(),
+                ),
+                self.getSymbolCount(),
+            );
+            errdefer allocator.free(first_set_table.slice);
+            @memset(first_set_table.slice, false);
+
+            var closures = try self.computeEpsilonClosures(allocator);
+            defer closures.deinit(allocator);
+
+            var nfa_state_to_rule_map = try allocator.alloc(usize, self.state_count);
+            defer allocator.free(nfa_state_to_rule_map);
+            {
+                var nfa_state: NfaState = 0;
+                for (self.rules, 0..) |rule, rule_id| {
+                    for (rule.rhs) |_| {
+                        nfa_state_to_rule_map[nfa_state] = rule_id;
+                        nfa_state += 1;
+                    }
+                    nfa_state_to_rule_map[nfa_state] = rule_id;
+                    nfa_state += 1;
+                }
+            }
+
+            for (0..self.getVariableCount()) |var_id| {
+                for (closures.row(var_id)) |nfa_state| {
+                    const rule_from_state = self.rules[nfa_state_to_rule_map[nfa_state]];
+                    const first_symbol = rule_from_state.rhs[0];
+                    switch (first_symbol) {
+                        .terminal_id => |id| first_set_table.row(var_id)[id] = true,
+                        .variable_id => |id| first_set_table.row(var_id)[self.getTerminalCount() + id] = true,
+                    }
+                }
             }
 
             return first_set_table.slice;
@@ -767,7 +847,50 @@ test "Grammar.initFromTuples [grammar2.2]" {
     try std.testing.expectEqualDeep(expected_grammar.terminals, actual_grammar.terminals);
 }
 
+test "epsilonClosures [custom5]" {
+    @setEvalBranchQuota(10000);
+
+    const TestVariable = test_common.TestVariable;
+    const TestTerminal = test_common.TestTerminal;
+
+    const V = TestVariable.fromString;
+    const T = TestTerminal.fromString;
+    const G = Grammar(TestVariable, TestTerminal);
+
+    const grammar = comptime G.initFromTuples(
+        .{
+            .{ V("S"), .{ V("A") } },
+            .{ V("A"), .{ V("A"), V("B"), T("c") } },
+            .{ V("A"), .{ V("B"), T("b") } },
+
+            .{ V("B"), .{ V("A"), T("c") } },
+            .{ V("B"), .{ T("q") } },
+        },
+        V("S"),
+        T("$"),
+    );
+
+    const allocator = std.testing.allocator;
+
+    const closures = try grammar.computeEpsilonClosures(allocator);
+    defer closures.deinit(allocator);
+
+    // S ->  (0) A  (1)
+    // A ->  (2) A  (3) B  (4) c (5)
+    // A ->  (6) B  (7) b  (8)
+    // B ->  (9) A (10) c (11)
+    // B -> (12) q
+    const expected_closures = [_]G.NfaState {
+        0, 2, 6, 9, 12, // S
+        2, 6, 9, 12,    // A
+        2, 6, 9, 12,    // B
+    };
+
+    try std.testing.expectEqualSlices(G.NfaState, &expected_closures, closures.data);
+}
+
 test "firsts_and_follows [grammar1.0]" {
+    @setEvalBranchQuota(10000);
     const TestVariable = test_common.TestVariable;
     const TestTerminal = test_common.TestWffTerminal;
 
@@ -1152,6 +1275,46 @@ test "first_and_follows [custom4]" {
         .{ V("C"), .{ T("c"), T("a"), T("z"), T("q"), V("A"), V("Q"), V("D") } },
         .{ V("D"), .{T("q")} },
         .{ V("Q"), .{T("z")} },
+    }, TestVariable, TestTerminal, grammar);
+
+    try std.testing.expectEqualSlices(bool, &expected_first_set, first_set);
+    comptime try std.testing.expectEqualSlices(bool, &expected_first_set, first_set_comptime);
+}
+
+test "first_and_follows [custom5]" {
+    @setEvalBranchQuota(10000);
+
+    const TestVariable = test_common.TestVariable;
+    const TestTerminal = test_common.TestTerminal;
+
+    const V = TestVariable.fromString;
+    const T = TestTerminal.fromString;
+    const G = Grammar(TestVariable, TestTerminal);
+
+    const grammar = comptime G.initFromTuples(
+        .{
+            .{ V("S"), .{ V("A") } },
+            .{ V("A"), .{ V("A"), V("B"), T("c") } },
+            .{ V("A"), .{ V("B"), T("b") } },
+
+            .{ V("B"), .{ V("A"), T("c") } },
+            .{ V("B"), .{ T("q") } },
+        },
+        V("S"),
+        T("$"),
+    );
+
+    var allocator = std.testing.allocator;
+
+    const first_set = try grammar.getFirstSet(allocator);
+    defer allocator.free(first_set);
+
+    const first_set_comptime = comptime grammar.getFirstSetComptime();
+
+    const expected_first_set = comptime firstTableFromTuples(.{
+        .{ V("S"), .{ T("q"), V("A"), V("B") } },
+        .{ V("A"), .{ T("q"), V("A"), V("B") } },
+        .{ V("B"), .{ T("q"), V("A"), V("B") } },
     }, TestVariable, TestTerminal, grammar);
 
     try std.testing.expectEqualSlices(bool, &expected_first_set, first_set);
