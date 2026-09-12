@@ -87,6 +87,8 @@ pub const Production = struct {
 ///   must be sorted such that every rule with a variable as the first symbol on
 ///   the rhs appears before those with a terminal. Within each group they must
 ///   then be sorted by symbol ID.
+/// * `state_count` is the number of states in the epsilon-NFA associated with
+///   this grammar.
 /// * `variables` is a slice containing all of the user defined `Variable`
 ///   objects found in the grammar rules. Each `Variable` object's symbol ID is
 ///   its index in the slice.
@@ -99,6 +101,7 @@ pub fn Grammar(comptime Variable: type, comptime Terminal: type) type {
         const Self = @This();
 
         rules: []const Production,
+        state_count: usize,
         variables: []const Variable,
         terminals: []const Terminal,
 
@@ -117,6 +120,7 @@ pub fn Grammar(comptime Variable: type, comptime Terminal: type) type {
                 // Initialize a grammar struct to populate.
                 var grammar = Self{
                     .rules = &[_]Production{},
+                    .state_count = 0,
                     .variables = &[_]Variable{start_variable},
                     .terminals = &[_]Terminal{},
                 };
@@ -172,6 +176,7 @@ pub fn Grammar(comptime Variable: type, comptime Terminal: type) type {
                     }
                     // Append the populated rule.
                     grammar.rules = grammar.rules ++ &[_]Production{rule};
+                    grammar.state_count += rule.rhs.len + 1;
                 }
                 grammar.terminals = grammar.terminals ++ &[_]Terminal{end_terminal};
 
@@ -256,6 +261,10 @@ pub fn Grammar(comptime Variable: type, comptime Terminal: type) type {
                     }
                 }
             }
+        }
+
+        pub fn getStateCount(self: Self) usize {
+            return self.state_count;
         }
 
         pub fn getRuleId(self: Self, rule: Production) ?usize {
@@ -664,6 +673,7 @@ test "Grammar.initFromTuples [grammar1.0]" {
 
     const expected_grammar = G{
         .rules = &[_]Production{ r0, r1, r2, r3, r4, r5, r6 },
+        .state_count = 31,
         .variables = &[_]TestVariable{ V("S"), V("wff") },
         .terminals = &[_]TestTerminal{ TestTerminal.Proposition, TestTerminal.Not, TestTerminal.LParen, TestTerminal.And, TestTerminal.RParen, TestTerminal.Or, TestTerminal.Cond, TestTerminal.Bicond, TestTerminal.End },
     };
@@ -747,6 +757,7 @@ test "Grammar.initFromTuples [grammar2.2]" {
 
     const expected_grammar = G{
         .rules = &[_]Production{ r0, r1, r2, r3, r4, r5, r6, r7, r8, r9, r10, r11 },
+        .state_count = 35,
         .variables = &[_]TestVariable{ V("S"), V("wff1"), V("wff2"), V("wff3"), V("wff4"), V("prop") },
         .terminals = &[_]TestTerminal{ .Bicond, .Cond, .Or, .And, .Not, .LParen, .RParen, .Proposition, .End },
     };
