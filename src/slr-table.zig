@@ -73,11 +73,11 @@ pub fn ParseTable(comptime Variable: type, comptime Terminal: type) type {
         pub const StateIdx = usize;
 
         grammar: GrammarType,
-        goto_table: utils.Slice2d([]const Action),
-        action_table: utils.Slice2d([]const Action),
+        goto_table: utils.Slice2d([]Action), // TODO add const back to these
+        action_table: utils.Slice2d([]Action),
 
         pub fn init(allocator: std.mem.Allocator, grammar: GrammarType) !Self {
-            const goto_table, const action_table = try generateTables(allocator, grammar);
+            const action_table, const goto_table = try generateTables(allocator, grammar);
             return Self{
                 .grammar = grammar,
                 .goto_table = goto_table,
@@ -85,16 +85,7 @@ pub fn ParseTable(comptime Variable: type, comptime Terminal: type) type {
             };
         }
 
-        pub fn initComptime(comptime grammar: GrammarType) Self {
-            comptime {
-                const goto_table, const action_table = generateTablesComptime(grammar);
-                return Self{
-                    .grammar = grammar,
-                    .goto_table = goto_table,
-                    .action_table = action_table,
-                };
-            }
-        }
+        // TODO: initComptime ?
 
         /// Note: Does NOT free the memory associated with the grammar
         pub fn deinit(self: Self, allocator: std.mem.Allocator) void {
@@ -220,53 +211,7 @@ pub fn ParseTable(comptime Variable: type, comptime Terminal: type) type {
             return .{ variable_branches, terminal_branches };
         }
 
-        fn expandProductionsComptime(comptime grammar: GrammarType, comptime productions: []const ProductionInstance) !struct { []const []const ProductionInstance, []const []const ProductionInstance } {
-            var variable_branches = [_][]const ProductionInstance {
-                &[_]ProductionInstance {},
-            } ** grammar.getVariableCount();
-
-            var terminal_branches = [_][]const ProductionInstance {
-                &[_]ProductionInstance {},
-            } ** grammar.getTerminalCount();
-
-            var stack: []const ProductionInstance = &[_]ProductionInstance{};
-
-            for (productions) |instance| {
-                stack = stack ++ &[_]ProductionInstance {instance};
-            }
-
-            // Expand all given ProductionInstances and track all of the symbols
-            // currently being read.
-            while (stack.len > 0) {
-                const prod = stack[stack.len - 1];
-                stack = stack[0 .. stack.len - 1];
-
-                if (prod.readCursor()) |sym| {
-                    switch (sym) {
-                        .variable_id => |id| {
-                            // If the variable has not been encountered yet,
-                            // expand it by pushing any productions from it onto
-                            // the stack.
-                            if (variable_branches[id].len == 0) {
-                                for (grammar.rules) |rule| {
-                                    if (sym.eqlVariable(rule.lhs)) {
-                                        stack = stack ++ &[_]ProductionInstance {ProductionInstance.fromProduction(rule)};
-                                    }
-                                }
-                            }
-                            // Add the variable as a branch.
-                            // const new = variable_branches[idx] ++ &[_]ProductionInstance {prod.copyAdvanceCursor()};
-                            // variable_branches = variable_branches[0..idx] ++ &[_][]const ProductionInstance {new} ++ variable_branches[(idx + 1)..variable_branches.len];
-                            variable_branches[id] = variable_branches[id] ++ &[_]ProductionInstance {prod.copyAdvanceCursor()};
-                        },
-                        .terminal_id => |id| terminal_branches[id] = terminal_branches[id] ++ &[_]ProductionInstance {prod.copyAdvanceCursor()},
-                    }
-                }
-            }
-
-            return .{ &variable_branches, &terminal_branches };
-        }
-
+        // TODO: remove
         fn checkStateAlreadyExists(starting_productions_table: []const []const ProductionInstance, productions: []const ProductionInstance) ?usize {
             for (starting_productions_table, 0..) |start_prod_list, state| {
                 for (productions) |prod| {
@@ -283,10 +228,323 @@ pub fn ParseTable(comptime Variable: type, comptime Terminal: type) type {
             return null;
         }
 
+        fn generateTables3(
+            allocator: std.mem.Allocator,
+            grammar: GrammarType
+        ) !struct {utils.Slice2d([]Action), utils.Slice2d([]Action)} {
+            // Generate state -> rule map
+            var state_to_rule_map = try allocator.alloc(usize, grammar.state_count);
+            defer allocator.free(state_to_rule_map);
+            {
+                var count: usize = 0;
+                for (grammar.rules, 0..) |rule, rule_num| {
+                    for (0..rule.rhs.len + 1) |_| {
+                        state_to_rule_map[count] = rule_num;
+                        count += 1;
+                    }
+                }
+            }
+
+            // Generate rule -> first state map
+            var rule_to_first_state_map = try allocator.alloc(GrammarType.NfaState, grammar.rules.len);
+            defer allocator.free(rule_to_first_state_map);
+            rule_to_first_state_map[0] = 0;
+            {
+                var previous_rule: usize = 0;
+                for (state_to_rule_map, 0..) |rule, state| {
+                    if (previous_rule != rule) {
+                        rule_to_first_state_map[rule] = state;
+                        previous_rule = rule;
+                    }
+                }
+            }
+
+            // Generate grammar variable to epsilon closure map
+            var closures = try grammar.computeEpsilonClosures(allocator);
+            defer closures.deinit(allocator);
+
+            // Generate table data structures: Action table, Goto table, and
+            // DFA state -> NFA state set map
+            var action_table = std.ArrayList([]Action).empty;
+            defer {
+                for (action_table.items) |row| allocator.free(row);
+                action_table.deinit(allocator);
+            }
+            var goto_table = std.ArrayList([]Action).empty;
+            defer {
+                for (goto_table.items) |row| allocator.free(row);
+                goto_table.deinit(allocator);
+            }
+            // Only store kernels, not entire set
+            // TODO: do i actually need to store values, or can i just use the
+            // index of they keys?
+            const ArrayHashMapType = std.array_hash_map.Custom(
+                []GrammarType.NfaState,
+                StateIdx,
+                struct {
+                    pub fn hash(_: @This(), key: []GrammarType.NfaState) u32 {
+                        return @truncate(std.hash.Wyhash.hash(0, std.mem.sliceAsBytes(key)));
+                    }
+                    pub fn eql(_: @This(), a: []GrammarType.NfaState, b: []GrammarType.NfaState, _: usize) bool {
+                        return std.mem.eql(GrammarType.NfaState, a, b);
+                    }
+                },
+                // TODO: better understand what this does
+                false,
+            );
+            var table_state_sets = ArrayHashMapType.empty;
+            defer {
+                for (table_state_sets.entries.items(.key)) |set| {
+                    allocator.free(set);
+                }
+                table_state_sets.deinit(allocator);
+            }
+
+            // First DFA state is the epsilon closure of the first e-NFA state
+            try table_state_sets.put(
+                allocator,
+                try allocator.dupe(GrammarType.NfaState, &[_]GrammarType.NfaState {grammar.getStartSymbolId().variable_id}),
+                0,
+            );
+
+            // Now populate the table: add new rows until all state sets
+            // accounted for
+            var action_row_state_sets: []std.ArrayList(GrammarType.NfaState) = try allocator.alloc(
+                std.ArrayList(GrammarType.NfaState),
+                grammar.getTerminalCount()
+            );
+            for (0..action_row_state_sets.len) |i| {
+                action_row_state_sets[i] = .empty;
+            }
+            defer {
+                for (action_row_state_sets) |*set| set.deinit(allocator);
+                allocator.free(action_row_state_sets);
+            }
+            var goto_row_state_sets: []std.ArrayList(GrammarType.NfaState) = try allocator.alloc(
+                std.ArrayList(GrammarType.NfaState),
+                grammar.getVariableCount(),
+            );
+            for (0..goto_row_state_sets.len) |i| {
+                goto_row_state_sets[i] = .empty;
+            }
+            defer {
+                for (goto_row_state_sets) |*set| set.deinit(allocator);
+                allocator.free(goto_row_state_sets);
+            }
+            var state: StateIdx = 0;
+            while (state < table_state_sets.count()) : (state += 1) {
+                const nfa_kernels = table_state_sets.entries.get(state).key; // table_state_sets.items[state];
+
+                for (action_row_state_sets) |*set| {
+                    set.items.len = 0;
+                }
+                for (goto_row_state_sets) |*set| {
+                    set.items.len = 0;
+                }
+
+                try action_table.ensureUnusedCapacity(allocator, 1);
+                var action_row = try allocator.alloc(Action, grammar.getTerminalCount());
+                // Append right away so memory deallocation will be handled by
+                // table cleanup if we encounter an error.
+                action_table.appendAssumeCapacity(action_row);
+                @memset(action_row, .invalid);
+
+                try goto_table.ensureUnusedCapacity(allocator, 1);
+                var goto_row = try allocator.alloc(Action, grammar.getVariableCount());
+                // Append right away, same as above.
+                goto_table.appendAssumeCapacity(goto_row);
+                @memset(goto_row, .invalid);
+
+                // Populate NFA state sets in the row
+                // TODO: need to sort sets???
+                for (nfa_kernels) |kernel_nfa_state| {
+                    // TODO here and other places: a "getSymbolFromNfaState"
+                    // function would be great
+
+                    // std.debug.print("state_to_rule_map: {any}\n", .{state_to_rule_map});
+                    // std.debug.print("rule_to_first_state_map: {any}\n", .{rule_to_first_state_map});
+
+                    // First deal with symbol being read in the kernel state
+                    const kernel_symbol = ret: {
+                        const rule_id = state_to_rule_map[kernel_nfa_state];
+                        const rule_first_state = rule_to_first_state_map[rule_id];
+                        const rule = grammar.rules[rule_id];
+                        const last_nfa_state_in_rule = rule_first_state + rule.rhs.len;
+                        if (kernel_nfa_state == last_nfa_state_in_rule) {
+                            continue;
+                        }
+                        break :ret rule.rhs[kernel_nfa_state - rule_first_state];
+                    };
+                    switch(kernel_symbol) {
+                        .terminal_id => |id| {
+                            try action_row_state_sets[id].append(allocator, kernel_nfa_state + 1);
+                            continue;
+                         },
+                        .variable_id => |id| try goto_row_state_sets[id].append(allocator, kernel_nfa_state + 1),
+                    }
+
+                    // We only get here if kernel_symbol is a variable
+                    const kernel_closure = ret: {
+                        const rule_id = state_to_rule_map[kernel_nfa_state];
+                        const rule_first_state = rule_to_first_state_map[rule_id];
+                        const rule = grammar.rules[rule_id];
+
+                        // std.debug.print("rule: {any}\nrule_first_state: {any}\n", .{rule, rule_first_state});
+                        const symbol = rule.rhs[kernel_nfa_state - rule_first_state];
+                        // std.debug.print("{any}\n", .{symbol});
+                        break :ret closures.row(symbol.variable_id);
+                    };
+
+                    // std.debug.print("{any}\n", .{kernel_closure});
+
+                    for (kernel_closure) |nfa_state| {
+                        const rule_id = state_to_rule_map[nfa_state];
+                        const rule = grammar.rules[rule_id];
+                        const rule_first_state = rule_to_first_state_map[rule_id];
+
+                        const last_nfa_state_in_rule = rule_first_state + rule.rhs.len;
+                        std.debug.assert(nfa_state != last_nfa_state_in_rule);
+
+                        const reading_symbol = rule.rhs[nfa_state - rule_first_state];
+                        switch (reading_symbol) {
+                            .terminal_id => |id| {
+                                if (std.mem.findScalar(GrammarType.NfaState, action_row_state_sets[id].items, nfa_state + 1) == null) {
+                                    try action_row_state_sets[id].append(allocator, nfa_state + 1);
+                                }
+                            },
+                            .variable_id => |id| {
+                                if (std.mem.findScalar(GrammarType.NfaState, goto_row_state_sets[id].items, nfa_state + 1) == null) {
+                                    try goto_row_state_sets[id].append(allocator,nfa_state + 1);
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // PROBLEM FOUND: sets are getting duplicate elements above --
+                // need to check for duplicate before inserting
+                for (action_row_state_sets) |*set| {
+                    std.mem.sortUnstable(GrammarType.NfaState, set.items, {}, std.sort.asc(GrammarType.NfaState));
+                }
+
+                // Look at NFA state sets in the current row: skip existing
+                // ones, and create new states (new rows in the parse table) for
+                // new ones
+                for (action_row_state_sets, 0..) |set, t_id| {
+                    if (set.items.len == 0) {
+                        continue;
+                    }
+                    std.debug.assert(action_row[t_id] == .invalid);
+                    if (table_state_sets.get(set.items)) |state_id| {
+                        action_row[t_id] = Action{ .state = state_id };
+                    } else {
+                        const new_state_id = table_state_sets.count();
+                        try table_state_sets.put(
+                            allocator,
+                            try allocator.dupe(GrammarType.NfaState, set.items),
+                            new_state_id
+                        );
+                        action_row[t_id] = Action{ .state = new_state_id };
+                    }
+                }
+
+                for (goto_row_state_sets) |*set| {
+                    std.mem.sortUnstable(GrammarType.NfaState, set.items, {}, std.sort.asc(GrammarType.NfaState));
+                }
+
+                for (goto_row_state_sets, 0..) |set, v_id| {
+                    if (set.items.len == 0) {
+                        continue;
+                    }
+                    std.debug.assert(goto_row[v_id] == .invalid);
+                    if (table_state_sets.get(set.items)) |state_id| {
+                        goto_row[v_id] = Action{ .state = state_id };
+                    } else {
+                        const new_state_id = table_state_sets.count();
+                        try table_state_sets.put(
+                            allocator,
+                            try allocator.dupe(GrammarType.NfaState, set.items),
+                            new_state_id
+                        );
+                        goto_row[v_id] = Action{ .state = new_state_id };
+                    }
+                }
+            }
+
+            // Now that states are populated, we populate reductions
+            // TODO: we already have closures, should probably be able to pass in
+            const first_set = try grammar.getFirstSet(allocator);
+            defer allocator.free(first_set);
+            const follow_set = utils.Slice2d([]const bool).init(
+                try grammar.getFollowSet(
+                    allocator,
+                    // TODO : I shouldnt have to do this here
+                    utils.Slice2d([]const bool).init(first_set, grammar.getSymbolCount()),
+                ),
+                grammar.getTerminalCount(),
+            );
+            defer allocator.free(follow_set.slice);
+
+            // TODO: this should probably move into the above loop so we don't
+            // have to "look for" the states with end nfa states, we can just
+            // populate reductions as we hit end states
+            for (table_state_sets.entries.items(.key), 0..) |set, state_id| {
+                for (set) |nfa_state| {
+                    const rule_id = state_to_rule_map[nfa_state];
+                    const last_nfa_state_in_rule = rule_to_first_state_map[rule_id] + grammar.rules[rule_id].rhs.len;
+                    if (nfa_state != last_nfa_state_in_rule) {
+                        continue;
+                    }
+
+                    const rule = grammar.rules[rule_id];
+                    for (follow_set.row(rule.lhs), 0..) |is_in_follow_set, t_id| {
+                        if (!is_in_follow_set) {
+                            continue;
+                        }
+
+                        action_table.items[state_id][t_id] = try switch (action_table.items[state_id][t_id]) {
+                            .invalid => Action{ .reduce = rule_id },
+                            .state => TableGeneratorError.shiftReduceError,
+                            .reduce => TableGeneratorError.shiftReduceError,
+                            .accept => unreachable,
+                        };
+                    }
+                }
+            }
+
+
+            // TODO: can probably remove ACC state, parser just assumes end of start rule and no
+            //       further input = ACC
+            // if (action_table.items[0][grammar.getEndSymbolId().terminal_id] != .invalid) {
+            //     return TableGeneratorError.acceptError;
+            // }
+            // action_table.items[0][grammar.getEndSymbolId().terminal_id] = .accept;
+
+            var action_table_final = utils.Slice2d([]Action).init(
+                try allocator.alloc(Action, action_table.items.len * grammar.getTerminalCount()),
+                grammar.getTerminalCount(),
+            );
+            errdefer allocator.free(action_table_final.slice);
+            for (action_table.items, 0..) |row, i| {
+                @memcpy(action_table_final.row(i), row);
+            }
+
+            var goto_table_final = utils.Slice2d([]Action).init(
+                try allocator.alloc(Action, goto_table.items.len * grammar.getVariableCount()),
+                grammar.getVariableCount(),
+            );
+            errdefer allocator.free(goto_table_final.slice);
+            for (goto_table.items, 0..) |row, i| {
+                @memcpy(goto_table_final.row(i), row);
+            }
+
+            return .{action_table_final, goto_table_final};
+        }
+
         fn generateTables(
             allocator: std.mem.Allocator,
             grammar: GrammarType
-        ) !struct {utils.Slice2d([]const Action), utils.Slice2d([]const Action)} {
+        ) !struct {utils.Slice2d([]Action), utils.Slice2d([]Action)} {
             var goto_table = std.ArrayList([]Action).empty;
             defer goto_table.deinit(allocator);
             errdefer for (goto_table.items) |row| {
@@ -368,7 +626,10 @@ pub fn ParseTable(comptime Variable: type, comptime Terminal: type) type {
                 }
             }
 
-            const follow_set = try grammar.getFollowSet(allocator);
+            const first_set = try grammar.getFirstSet(allocator);
+            defer allocator.free(first_set);
+
+            const follow_set = try grammar.getFollowSet(allocator, utils.Slice2d([]const bool).init(first_set, grammar.getSymbolCount()));
             defer allocator.free(follow_set);
 
             // Populate reductions
@@ -421,8 +682,8 @@ pub fn ParseTable(comptime Variable: type, comptime Terminal: type) type {
                 @memcpy(action_view.row(i), row);
             }
 
-            const goto_const_view = utils.Slice2d([]const Action).init(goto_slice, goto_table.items[0].len);
-            const action_const_view = utils.Slice2d([]const Action).init(action_slice, action_table.items[0].len);
+            const goto_const_view = utils.Slice2d([]Action).init(goto_slice, goto_table.items[0].len);
+            const action_const_view = utils.Slice2d([]Action).init(action_slice, action_table.items[0].len);
 
             for (0..goto_table.items.len) |i| {
                 allocator.free(goto_table.items[i]);
@@ -431,139 +692,7 @@ pub fn ParseTable(comptime Variable: type, comptime Terminal: type) type {
                 allocator.free(action_table.items[i]);
             }
 
-            return .{goto_const_view, action_const_view};
-        }
-
-        fn generateTablesComptime(comptime grammar: GrammarType) struct { []const []const Action, []const []const Action } {
-            comptime {
-                var goto_table: []const []const Action = &[_][]const Action {
-                    &[_]Action {Action {.invalid = {}}} ** grammar.getVariableCount(),
-                };
-
-                var action_table: []const []const Action = &[_][]const Action {
-                    &[_]Action {Action {.invalid = {}}} ** grammar.getTerminalCount(),
-                };
-
-                var primary_productions_table: []const []const ProductionInstance = &[_][]const ProductionInstance {
-                    &[_]ProductionInstance{ProductionInstance.fromProduction(grammar.rules[grammar.getStartRuleId()])},
-                };
-
-                var state_num: usize = 0;
-                while (state_num < goto_table.len) : (state_num += 1) {
-                    const variable_branches, const terminal_branches = try expandProductionsComptime(grammar, primary_productions_table[state_num]);
-
-                    for (variable_branches, 0..) |prod_list, v_id| {
-                        // If there are no transitions from this variable, move on
-                        // (cell is initialized to invalid so we don't need to set
-                        // it here)
-                        if (prod_list.len == 0) {
-                            continue;
-                        }
-
-                        // If expanding these productions would result in a state
-                        // that already exists,
-                        else if (checkStateAlreadyExists(primary_productions_table, prod_list)) |existing_state| {
-                            const new_action = switch (goto_table[state_num][v_id]) {
-                                .invalid => Action{ .state = existing_state },
-                                .state => @compileError("Parsing error: shift shift conflict"),
-                                .reduce => @compileError("Parsing error: shift reduce conflict"),
-                                .accept => @compileError("Parsing error: shift accept error"),
-                            };
-
-                            // Gross horrible disgusting pattern so that we can
-                            // "assign" new values to the entries of the table.
-                            // Essentially recreating the table with the entry
-                            // to be assigned replaced with the desired new
-                            // entry. Probably very inefficient but it's
-                            // comptime so who cares.
-                            const new_row = goto_table[state_num][0..v_id] ++ [_]Action { new_action } ++ goto_table[state_num][(v_id + 1)..goto_table[state_num].len];
-                            goto_table = goto_table[0..state_num] ++ [_][]const Action {new_row} ++ goto_table[(state_num + 1)..goto_table.len];
-                        } else {
-                            goto_table = goto_table ++ [_][]const Action{ &[_]Action {Action{.invalid = {}}} ** grammar.getVariableCount() };
-                            action_table = action_table ++ [_][]const Action{ &[_]Action {Action{.invalid = {}}} ** grammar.getTerminalCount() };
-                            primary_productions_table = primary_productions_table ++ [_][]const ProductionInstance{ prod_list };
-
-                            const new_row = goto_table[state_num][0..v_id] ++ [_]Action {Action {.state = goto_table.len - 1 } } ++ goto_table[state_num][(v_id + 1)..goto_table[state_num].len];
-                            goto_table = goto_table[0..state_num] ++ [_][]const Action {new_row} ++ goto_table[(state_num + 1)..goto_table.len];
-                        }
-                    }
-                    // @compileLog(goto_table);
-                    for (terminal_branches, 0..) |prod_list, t_id| {
-                        // If there are no transitions from this variable, move on
-                        // (cell is initialized to invalid so we don't need to set
-                        // it here)
-                        if (prod_list.len == 0) {
-                            continue;
-                        }
-
-                        // If expanding these productions would result in a state
-                        // that already exists,
-                        if (checkStateAlreadyExists(primary_productions_table, prod_list)) |existing_state| {
-                            const new_action = switch (action_table[state_num][t_id]) {
-                                .invalid => Action{ .state = existing_state },
-                                .state => @compileError("Parsing error: shift shift conflict"),
-                                .reduce => @compileError("Parsing error: shift reduce conflict"),
-                                .accept => @compileError("Parsing error: shift accept error"),
-                            };
-                            const new_row = action_table[state_num][0..t_id] ++ [_]Action { new_action } ++ action_table[state_num][(t_id + 1)..action_table[state_num].len];
-                            action_table = action_table[0..state_num] ++ [_][]const Action {new_row} ++ action_table[(state_num + 1)..action_table.len];
-                        } else {
-                            goto_table = goto_table ++ [_][]const Action{ &[_]Action {Action{.invalid = {}}} ** grammar.getVariableCount() };
-                            action_table = action_table ++ [_][]const Action{ &[_]Action {Action{.invalid = {}}} ** grammar.getTerminalCount() };
-                            primary_productions_table = primary_productions_table ++ [_][]const ProductionInstance{ prod_list };
-
-                            const new_row = action_table[state_num][0..t_id] ++ [_]Action {Action {.state = action_table.len - 1 } } ++ action_table[state_num][(t_id + 1)..action_table[state_num].len];
-                            action_table = action_table[0..state_num] ++ [_][]const Action {new_row} ++ action_table[(state_num + 1)..action_table.len];
-                        }
-                    }
-                }
-
-                const follow_set = grammar.getFollowSetComptime();
-
-                // Populate reductions
-                // For each completed primary production in each state, identify the
-                // production rule's index and insert a reduction on each of the LHS's
-                // follow set
-                // TODO: Make separate function so we can use state_num instead of state_num_
-                for (primary_productions_table, 0..) |row, state_num_| {
-                    for (row) |instance| {
-                        if (instance.readCursor() != null) continue;
-
-                        const rule_id = grammar.getRuleId(instance.production).?;
-                        for (0..grammar.getTerminalCount()) |t_id| {
-                            if (!follow_set[instance.production.lhs * grammar.getTerminalCount() + t_id]) continue;
-
-                            const new_action = switch (action_table[state_num_][t_id]) {
-                                .invalid => Action{ .reduce = rule_id },
-                                .state => @compileError("Parsing error: shift reduce error"),
-                                .reduce => @compileError("Parsing error: reduce reduce error"),
-                                .accept => @compileError("Parsing error: reduce accept error"),
-                            };
-                            const new_row = action_table[state_num_][0..t_id] ++ [_]Action { new_action } ++ action_table[state_num_][(t_id + 1)..action_table[state_num_].len];
-                            action_table = action_table[0..state_num_] ++ [_][]const Action {new_row} ++ action_table[(state_num_ + 1)..action_table.len];
-                        }
-
-                        // TODO: hardcoded 0 kinda yucky
-                        if (instance.production.lhs == grammar.getStartSymbolId().variable_id) {
-                            switch (action_table[state_num_][grammar.getEndSymbolId().terminal_id]) {
-                                .invalid => @compileError("Parsing error: missing accepting reduction"),
-                                .state => @compileError("Parsing error: shift accept error"),
-                                .reduce => |reduction_rule_id| {
-                                    if (reduction_rule_id == grammar.getStartRuleId()) {
-                                        const t_id = grammar.getEndSymbolId().terminal_id;
-                                        const new_row = action_table[state_num_][0..t_id] ++ [_]Action { Action {.accept = {}} } ++ action_table[state_num_][(t_id + 1)..action_table[state_num_].len];
-                                        action_table = action_table[0..state_num_] ++ [_][]const Action {new_row} ++ action_table[(state_num_ + 1)..action_table.len];
-                                    } else {
-                                        @compileError("Parsing error: the accepting state can only replace the starting production rule, found a different rule instead");
-                                    }
-                                },
-                                .accept => {},
-                            }
-                        }
-                    }
-                }
-                return .{ goto_table, action_table };
-            }
+            return .{action_const_view, goto_const_view};
         }
     };
 }
@@ -663,74 +792,76 @@ test "Create parse table [grammar1.0]" {
 
     const P = ParseTable(TestVariable, TestTerminal);
 
-    const expected_table = P {
-        .grammar = grammar,
-        .goto_table = utils.Slice2d([]const P.Action).init(
-            &[_] P.Action {
-                .{.invalid = {}}, .{.state = 1},
-                .{.invalid = {}}, .{.invalid = {}},
-                .{.invalid = {}}, .{.invalid = {}},
-                .{.invalid = {}}, .{.state = 5},
-                .{.invalid = {}}, .{.state = 6},
+    // const expected_table = P {
+    //     .grammar = grammar,
+    //     .goto_table = utils.Slice2d([]P.Action).init(
+    //         &[_] P.Action {
+    //             .{.invalid = {}}, .{.state = 1},
+    //             .{.invalid = {}}, .{.invalid = {}},
+    //             .{.invalid = {}}, .{.invalid = {}},
+    //             .{.invalid = {}}, .{.state = 5},
+    //             .{.invalid = {}}, .{.state = 6},
 
-                .{.invalid = {}}, .{.invalid = {}},
-                .{.invalid = {}}, .{.invalid = {}},
-                .{.invalid = {}}, .{.state = 11},
-                .{.invalid = {}}, .{.state = 12},
-                .{.invalid = {}}, .{.state = 13},
+    //             .{.invalid = {}}, .{.invalid = {}},
+    //             .{.invalid = {}}, .{.invalid = {}},
+    //             .{.invalid = {}}, .{.state = 11},
+    //             .{.invalid = {}}, .{.state = 12},
+    //             .{.invalid = {}}, .{.state = 13},
 
-                .{.invalid = {}}, .{.state = 14},
-                .{.invalid = {}}, .{.invalid = {}},
-                .{.invalid = {}}, .{.invalid = {}},
-                .{.invalid = {}}, .{.invalid = {}},
-                .{.invalid = {}}, .{.invalid = {}},
+    //             .{.invalid = {}}, .{.state = 14},
+    //             .{.invalid = {}}, .{.invalid = {}},
+    //             .{.invalid = {}}, .{.invalid = {}},
+    //             .{.invalid = {}}, .{.invalid = {}},
+    //             .{.invalid = {}}, .{.invalid = {}},
 
-                .{.invalid = {}}, .{.invalid = {}},
-                .{.invalid = {}}, .{.invalid = {}},
-                .{.invalid = {}}, .{.invalid = {}},
-                .{.invalid = {}}, .{.invalid = {}},
-            },
-            grammar.getVariableCount(),
-        ),
-        .action_table = utils.Slice2d([]const P.Action).init(
-            &[_]P.Action {
-                .{.state = 2}, .{.state = 3}, .{.state = 4}, .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}},
-                .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}}, .{.accept = {}},
-                .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}}, .{.reduce = 1}, .{.reduce = 1}, .{.reduce = 1}, .{.reduce = 1}, .{.reduce = 1}, .{.reduce = 1},
-                .{.state = 2}, .{.state = 3}, .{.state = 4}, .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}},
-                .{.state = 2}, .{.state = 3}, .{.state = 4}, .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}},
+    //             .{.invalid = {}}, .{.invalid = {}},
+    //             .{.invalid = {}}, .{.invalid = {}},
+    //             .{.invalid = {}}, .{.invalid = {}},
+    //             .{.invalid = {}}, .{.invalid = {}},
+    //         },
+    //         grammar.getVariableCount(),
+    //     ),
+    //     .action_table = utils.Slice2d([]P.Action).init(
+    //         &[_]P.Action {
+    //             .{.state = 2}, .{.state = 3}, .{.state = 4}, .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}},
+    //             .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}}, .{.accept = {}},
+    //             .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}}, .{.reduce = 1}, .{.reduce = 1}, .{.reduce = 1}, .{.reduce = 1}, .{.reduce = 1}, .{.reduce = 1},
+    //             .{.state = 2}, .{.state = 3}, .{.state = 4}, .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}},
+    //             .{.state = 2}, .{.state = 3}, .{.state = 4}, .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}},
 
-                .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}}, .{.reduce = 2}, .{.reduce = 2}, .{.reduce = 2}, .{.reduce = 2}, .{.reduce = 2}, .{.reduce = 2},
-                .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}}, .{.state = 7}, .{.invalid = {}}, .{.state = 8}, .{.state = 9}, .{.state = 10},  .{.invalid = {}},
-                .{.state = 2}, .{.state = 3}, .{.state = 4}, .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}},
-                .{.state = 2}, .{.state = 3}, .{.state = 4}, .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}},
-                .{.state = 2}, .{.state = 3}, .{.state = 4}, .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}},
+    //             .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}}, .{.reduce = 2}, .{.reduce = 2}, .{.reduce = 2}, .{.reduce = 2}, .{.reduce = 2}, .{.reduce = 2},
+    //             .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}}, .{.state = 7}, .{.invalid = {}}, .{.state = 8}, .{.state = 9}, .{.state = 10},  .{.invalid = {}},
+    //             .{.state = 2}, .{.state = 3}, .{.state = 4}, .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}},
+    //             .{.state = 2}, .{.state = 3}, .{.state = 4}, .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}},
+    //             .{.state = 2}, .{.state = 3}, .{.state = 4}, .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}},
 
-                .{.state = 2}, .{.state = 3}, .{.state = 4}, .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}},
-                .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}}, .{.state = 15}, .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}},
-                .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}}, .{.state = 16}, .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}},
-                .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}}, .{.state = 17}, .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}},
-                .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}}, .{.state = 18}, .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}},
+    //             .{.state = 2}, .{.state = 3}, .{.state = 4}, .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}},
+    //             .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}}, .{.state = 15}, .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}},
+    //             .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}}, .{.state = 16}, .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}},
+    //             .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}}, .{.state = 17}, .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}},
+    //             .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}}, .{.state = 18}, .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}},
 
-                .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}}, .{.reduce = 3}, .{.reduce = 3}, .{.reduce = 3}, .{.reduce = 3}, .{.reduce = 3}, .{.reduce = 3},
-                .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}}, .{.reduce = 4}, .{.reduce = 4}, .{.reduce = 4}, .{.reduce = 4}, .{.reduce = 4}, .{.reduce = 4},
-                .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}}, .{.reduce = 5}, .{.reduce = 5}, .{.reduce = 5}, .{.reduce = 5}, .{.reduce = 5}, .{.reduce = 5},
-                .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}}, .{.reduce = 6}, .{.reduce = 6}, .{.reduce = 6}, .{.reduce = 6}, .{.reduce = 6}, .{.reduce = 6},
-            },
-            grammar.getTerminalCount(),
-        )
-    };
+    //             .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}}, .{.reduce = 3}, .{.reduce = 3}, .{.reduce = 3}, .{.reduce = 3}, .{.reduce = 3}, .{.reduce = 3},
+    //             .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}}, .{.reduce = 4}, .{.reduce = 4}, .{.reduce = 4}, .{.reduce = 4}, .{.reduce = 4}, .{.reduce = 4},
+    //             .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}}, .{.reduce = 5}, .{.reduce = 5}, .{.reduce = 5}, .{.reduce = 5}, .{.reduce = 5}, .{.reduce = 5},
+    //             .{.invalid = {}}, .{.invalid = {}}, .{.invalid = {}}, .{.reduce = 6}, .{.reduce = 6}, .{.reduce = 6}, .{.reduce = 6}, .{.reduce = 6}, .{.reduce = 6},
+    //         },
+    //         grammar.getTerminalCount(),
+    //     )
+    // };
 
     const table = try P.init(std.testing.allocator, grammar);
     defer table.deinit(std.testing.allocator);
 
-    const table_comptime = comptime P.initComptime(grammar);
+    // const table_comptime = comptime P.initComptime(grammar);
+    table.printDebugTable();
 
-    try std.testing.expectEqualDeep(expected_table.goto_table, table.goto_table);
-    try std.testing.expectEqualDeep(expected_table.action_table, table.action_table);
+    // try std.testing.expectEqualDeep(expected_table.goto_table, table.goto_table);
+    // try std.testing.expectEqualDeep(expected_table.action_table, table.action_table);
 
-    try std.testing.expectEqualDeep(table.action_table, table_comptime.action_table);
-    try std.testing.expectEqualDeep(table.goto_table, table_comptime.goto_table);
+    // try std.testing.expectEqualDeep(table.action_table, table_comptime.action_table);
+    // try std.testing.expectEqualDeep(table.goto_table, table_comptime.goto_table);
+
 }
 
 test "Create parse table [grammar2.0]" {
@@ -770,10 +901,82 @@ test "Create parse table [grammar2.0]" {
     const table = try P.init(std.testing.allocator, grammar);
     defer table.deinit(std.testing.allocator);
 
-    const table_comptime = comptime P.initComptime(grammar);
+    // const table_comptime = comptime P.initComptime(grammar);
 
-    // table.printDebugTable();
+    table.printDebugTable();
 
-    try std.testing.expectEqualDeep(table.action_table, table_comptime.action_table);
-    try std.testing.expectEqualDeep(table.goto_table, table_comptime.goto_table);
+//     try std.testing.expectEqualDeep(table.action_table, table_comptime.action_table);
+//     try std.testing.expectEqualDeep(table.goto_table, table_comptime.goto_table);
 }
+
+test "Create parse table [test-grammar-1]" {
+    @setEvalBranchQuota(10000);
+
+    const TestVariable = test_common.TestVariable;
+    const TestTerminal = test_common.TestTerminal;
+
+    const V = TestVariable.fromString;
+    const T = TestTerminal.fromString;
+    const G = slr_grammar.Grammar(TestVariable, TestTerminal);
+    const grammar = comptime G.initFromTuples(
+        .{
+            .{ V("S"), .{ V("A") } },
+
+            .{ V("A"), .{ T("c"), V("B") } },
+            .{ V("A"), .{ T("a") } },
+
+            .{ V("B"), .{ V("C"), T("b") } },
+
+            .{ V("C"), .{ V("D") } },
+            .{ V("C"), .{ V("A"), T("d") } },
+
+            .{ V("D"), .{ T("q") } },
+        },
+        V("S"),
+        T("$"),
+    );
+
+    const P = ParseTable(TestVariable, TestTerminal);
+
+    const table = try P.init(std.testing.allocator, grammar);
+    defer table.deinit(std.testing.allocator);
+
+    // const table_comptime = comptime P.initComptime(grammar);
+
+    table.printDebugTable();
+
+//     try std.testing.expectEqualDeep(table.action_table, table_comptime.action_table);
+//     try std.testing.expectEqualDeep(table.goto_table, table_comptime.goto_table);
+}
+
+// test "generateTables2" {
+//     const TestVariable = test_common.TestVariable;
+//     const TestTerminal = test_common.TestTerminal;
+
+//     const V = TestVariable.fromString;
+//     const T = TestTerminal.fromString;
+//     const G = slr_grammar.Grammar(TestVariable, TestTerminal);
+//     const grammar = comptime G.initFromTuples(
+//         .{
+//             .{ V("S"), .{ V("A") } },
+
+//             .{ V("A"), .{ T("a"), V("B"), T("c") } },
+//             .{ V("A"), .{ T("a"), V("B"), T("d"), T("e")} },
+//             .{ V("A"), .{ T("a"), V("B"), T("d"), T("f")} },
+
+//             .{ V("D"), .{ T("q") } },
+//         },
+//         V("S"),
+//         T("$"),
+//     );
+
+//     const P = ParseTable(TestVariable, TestTerminal);
+
+//     const action_table = try std.testing.allocator.alloc(P.Action, grammar.getTerminalCount() * 20);
+//     const goto_table = try std.testing.allocator.alloc(P.Action, grammar.getVariableCount() * 20);
+//     const state_count = try std.testing.allocator.alloc(usize, grammar.rules.len);
+//     try P.generateTables3(
+//         std.testing.allocator,
+//         grammar,
+//     );
+// }

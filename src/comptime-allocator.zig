@@ -1,3 +1,5 @@
+// https://codeberg.org/ziglang/zig/issues/30711
+
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Alignment = std.mem.Alignment;
@@ -14,7 +16,6 @@ pub const comptime_allocator: Allocator = .{
 };
 fn comptimeAlloc(_: *anyopaque, len: usize, alignment: Alignment, _: usize) ?[*]u8 {
     if (!@inComptime()) @panic("comptimeAlloc called at runtime");
-    // @compileLog("BINGUS");
     comptime {
         var buf: [len]u8 align(alignment.toByteUnits()) = undefined;
         return &buf;

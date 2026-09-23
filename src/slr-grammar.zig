@@ -4,6 +4,8 @@ const comptime_allocator = @import("comptime-allocator.zig");
 const test_common = @import("test-common.zig");
 const utils = @import("utils.zig");
 
+// TODO: model performance with tools from https://youtu.be/UJ_W0O3sFnY?si=Oo2_ld5CdcuyUFpu
+
 /// A numerical ID associated with a symbol in a formal grammar (a variable or a
 /// terminal).
 pub const SymbolId = union(enum) {
@@ -99,8 +101,10 @@ pub const Production = struct {
 pub fn Grammar(comptime Variable: type, comptime Terminal: type) type {
     return struct {
         const Self = @This();
-        const NfaState = usize;
+        pub const NfaState = usize;
 
+        // TODO: make this a ragged array (i.e. all productions sharing one
+        // block of memory instead of rhs pointing to other blocks)
         rules: []const Production,
         state_count: usize,
         variables: []const Variable,
@@ -113,6 +117,8 @@ pub fn Grammar(comptime Variable: type, comptime Terminal: type) type {
         /// * `end_terminal` is the terminal that will be used to mark the
         ///   end of a string during parsing.
         pub fn initFromTuples(
+            // TODO: make `start_variable` `start_rule` instead
+            // to guqrantee no multiple start paths
             comptime rule_tuples: anytype,
             comptime start_variable: Variable,
             comptime end_terminal: Terminal
@@ -315,6 +321,8 @@ pub fn Grammar(comptime Variable: type, comptime Terminal: type) type {
             return SymbolId{ .terminal_id = self.getTerminalCount() - 1 };
         }
 
+        // TODO: Need to make sure things still work if we have multiple start
+        // rules (e.g. S->A|B) OR limit to a single production for start rule
         pub fn getStartRuleId(_: Self) usize {
             return 0;
         }
@@ -323,8 +331,26 @@ pub fn Grammar(comptime Variable: type, comptime Terminal: type) type {
             return self.rules[rule_id];
         }
 
+        // TODO: optimize: use tarjan's scc algorithm
+
+        // TODO: Is there a way to make rowUnion more efficient? Maybe keep a
+        // second stack or map maintained or sth?
+
+        // TODO: FOR DFS: theoretically only rquires one Symbol.VariableType
+        // to store path_branches
+        // e.g. for a flat tree it would be 1|11111...11111
+        //    or for a larger graph it might be 1111|1111|11111...
+        // and for a line it would be 1|1|1|1|...|1
+        // where each |x| is the child index
+
+        // TODO: some of this could be abstracted to NFA or Graph specific
+        // helper functions, which would help make this function shorter
+        // and also reduce some wasted allocations (e.g. populated does not
+        // still need to be allocated when assembling the final closure lists)
+
+
         /// Caller must free returned RaggedArray
-        fn computeEpsilonClosures(
+        pub fn computeEpsilonClosures(
             self: Self,
             allocator: std.mem.Allocator,
         ) !utils.RaggedArray(NfaState) {
@@ -648,6 +674,7 @@ pub fn Grammar(comptime Variable: type, comptime Terminal: type) type {
                         .terminal_id => continue,
                         .variable_id => |v_id| switch (next_symbol_id) {
                             .terminal_id => |next_t_id| follow_set.row(v_id)[next_t_id] = true,
+                            // TODO: first set is now different row length, should add a check for this in sliceUnion!!!
                             .variable_id => |next_v_id| utils.sliceUnion(follow_set.row(v_id), first_set.row(next_v_id)[0..self.getTerminalCount()]),
                         }
                     }
