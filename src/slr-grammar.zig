@@ -584,9 +584,9 @@ pub fn Grammar(comptime Variable: type, comptime Terminal: type) type {
             var first_set_table = utils.Slice2d([]bool).init(
                 try allocator.alloc(
                     bool,
-                    self.getVariableCount() * self.getSymbolCount(),
+                    self.getVariableCount() * self.getTerminalCount(),
                 ),
-                self.getSymbolCount(),
+                self.getTerminalCount(),
             );
             errdefer allocator.free(first_set_table.slice);
             @memset(first_set_table.slice, false);
@@ -614,7 +614,7 @@ pub fn Grammar(comptime Variable: type, comptime Terminal: type) type {
                     const first_symbol = rule_from_state.rhs[0];
                     switch (first_symbol) {
                         .terminal_id => |id| first_set_table.row(var_id)[id] = true,
-                        .variable_id => |id| first_set_table.row(var_id)[self.getTerminalCount() + id] = true,
+                        .variable_id => {},
                     }
                 }
             }
@@ -657,7 +657,7 @@ pub fn Grammar(comptime Variable: type, comptime Terminal: type) type {
             first_set: utils.Slice2d([]const bool),
         ) void {
             std.debug.assert(follow_set.slice.len >= self.getVariableCount() * self.getTerminalCount());
-            std.debug.assert(first_set.slice.len >= self.getVariableCount() * self.getSymbolCount());
+            std.debug.assert(first_set.slice.len >= self.getVariableCount() * self.getTerminalCount());
 
             @memset(follow_set.slice, false);
 
@@ -675,7 +675,7 @@ pub fn Grammar(comptime Variable: type, comptime Terminal: type) type {
                         .variable_id => |v_id| switch (next_symbol_id) {
                             .terminal_id => |next_t_id| follow_set.row(v_id)[next_t_id] = true,
                             // TODO: first set is now different row length, should add a check for this in sliceUnion!!!
-                            .variable_id => |next_v_id| utils.sliceUnion(follow_set.row(v_id), first_set.row(next_v_id)[0..self.getTerminalCount()]),
+                            .variable_id => |next_v_id| utils.sliceUnion(follow_set.row(v_id), first_set.row(next_v_id)),
                         }
                     }
                 }
@@ -940,8 +940,8 @@ test "firsts_and_follows [grammar1.0]" {
     const first_set_comptime = comptime grammar.getFirstSetComptime();
 
     const expected_firsts = [_]bool{
-        true, true, true, false, false, false, false, false, false, false, true,
-        true, true, true, false, false, false, false, false, false, false, false
+        true, true, true, false, false, false, false, false, false,
+        true, true, true, false, false, false, false, false, false,
     };
 
     try std.testing.expectEqualSlices(bool, &expected_firsts, first_set);
@@ -1019,12 +1019,12 @@ test "firsts_and_follows [grammar2.2]" {
     const first_set_comptime = comptime grammar.getFirstSetComptime();
 
     const expected_firsts = [_]bool{
-        false, false, false, false, true,  true, false, true, false, false, true,  true,  true,  true,  true,
-        false, false, false, false, true,  true, false, true, false, false, true,  true,  true,  true,  true,
-        false, false, false, false, true,  true, false, true, false, false, false, true,  true,  true,  true,
-        false, false, false, false, true,  true, false, true, false, false, false, false, true,  true,  true,
-        false, false, false, false, true,  true, false, true, false, false, false, false, false, false, true,
-        false, false, false, false, false, true, false, true, false, false, false, false, false, false, false,
+        false, false, false, false, true,  true, false, true, false,
+        false, false, false, false, true,  true, false, true, false,
+        false, false, false, false, true,  true, false, true, false,
+        false, false, false, false, true,  true, false, true, false,
+        false, false, false, false, true,  true, false, true, false,
+        false, false, false, false, false, true, false, true, false,
     };
     try std.testing.expectEqualSlices(bool, &expected_firsts, first_set);
     comptime try std.testing.expectEqualSlices(bool, &expected_firsts, first_set_comptime);
@@ -1141,10 +1141,10 @@ test "first_and_follows [custom1]" {
 
     const first_set_comptime = comptime grammar.getFirstSetComptime();
 
-    const expected_first_set = comptime firstTableFromTuples(
+    const expected_first_set = comptime followTableFromTuples(
         .{
-            .{ V("S"), .{ T("("), T("#"), T("~"), V("A"), V("B") } },
-            .{ V("A"), .{ T("("), T("#"), T("~"), V("B") } },
+            .{ V("S"), .{ T("("), T("#"), T("~") } },
+            .{ V("A"), .{ T("("), T("#"), T("~") } },
             .{ V("B"), .{ T("("), T("#") } },
         },
         TestVariable,
@@ -1152,7 +1152,8 @@ test "first_and_follows [custom1]" {
         grammar,
 
     );
-
+    // TODO: how to make comptime tests fail nicer (avoid compile error, or
+    //       make more descriptive)
     try std.testing.expectEqualSlices(bool, &expected_first_set, first_set);
     comptime try std.testing.expectEqualSlices(bool, &expected_first_set, first_set_comptime);
 }
@@ -1192,12 +1193,12 @@ test "first_and_follows [custom2]" {
 
     const first_set_comptime = comptime grammar.getFirstSetComptime();
 
-    const expected_first_set = comptime firstTableFromTuples(
+    const expected_first_set = comptime followTableFromTuples(
         .{
-            .{ V("S"), .{ T("c"), T("a"), V("A") } },
+            .{ V("S"), .{ T("c"), T("a") } },
             .{ V("A"), .{ T("c"), T("a") } },
-            .{ V("B"), .{ T("c"), T("a"), T("q"), V("C"), V("D"), V("A") } },
-            .{ V("C"), .{ T("c"), T("a"), T("q"), V("D"), V("A") } },
+            .{ V("B"), .{ T("c"), T("a"), T("q") } },
+            .{ V("C"), .{ T("c"), T("a"), T("q") } },
             .{ V("D"), .{ T("q") } },
         },
         TestVariable,
@@ -1221,19 +1222,19 @@ test "first_and_follows [custom3]" {
 
     const grammar = comptime G.initFromTuples(
         .{
-            .{ V("S"), .{V("A")} },
+            .{ V("S"), .{ V("A") } },
 
             .{ V("A"), .{ T("c"), V("B") } },
-            .{ V("A"), .{V("Q")} },
-            .{ V("A"), .{T("a")} },
+            .{ V("A"), .{ V("Q") } },
+            .{ V("A"), .{ T("a") } },
 
             .{ V("B"), .{ V("C"), T("b") } },
 
             .{ V("C"), .{ V("A"), T("d") } },
-            .{ V("C"), .{V("D")} },
+            .{ V("C"), .{ V("D") } },
 
-            .{ V("D"), .{T("q")} },
-            .{ V("Q"), .{T("z")} },
+            .{ V("D"), .{ T("q") } },
+            .{ V("Q"), .{ T("z") } },
         },
         V("S"),
         T("$"),
@@ -1246,13 +1247,13 @@ test "first_and_follows [custom3]" {
 
     const first_set_comptime = comptime grammar.getFirstSetComptime();
 
-    const expected_first_set = comptime firstTableFromTuples(.{
-        .{ V("S"), .{ T("c"), T("a"), T("z"), V("A"), V("Q") } },
-        .{ V("A"), .{ T("c"), T("a"), T("z"), V("Q") } },
-        .{ V("B"), .{ T("c"), T("a"), T("z"), T("q"), V("C"), V("A"), V("D"), V("Q")} },
-        .{ V("C"), .{ T("c"), T("a"), T("z"), T("q"), V("A"), V("D"), V("Q") } },
-        .{ V("D"), .{T("q")} },
-        .{ V("Q"), .{T("z")} },
+    const expected_first_set = comptime followTableFromTuples(.{
+        .{ V("S"), .{ T("c"), T("a"), T("z") } },
+        .{ V("A"), .{ T("c"), T("a"), T("z") } },
+        .{ V("B"), .{ T("c"), T("a"), T("z"), T("q") } },
+        .{ V("C"), .{ T("c"), T("a"), T("z"), T("q") } },
+        .{ V("D"), .{ T("q") } },
+        .{ V("Q"), .{ T("z") } },
     }, TestVariable, TestTerminal, grammar);
 
     try std.testing.expectEqualSlices(bool, &expected_first_set, first_set);
@@ -1271,18 +1272,18 @@ test "first_and_follows [custom4]" {
 
     const grammar = comptime G.initFromTuples(
         .{
-            .{ V("S"), .{V("A")} },
+            .{ V("S"), .{ V("A") } },
             .{ V("A"), .{ T("c"), V("B") } },
-            .{ V("A"), .{V("Q")} },
-            .{ V("A"), .{T("a")} },
+            .{ V("A"), .{ V("Q") } },
+            .{ V("A"), .{ T("a") } },
 
             .{ V("B"), .{ V("C"), T("b") } },
 
             .{ V("C"), .{ V("A"), T("d") } },
-            .{ V("C"), .{V("D")} },
+            .{ V("C"), .{ V("D") } },
 
-            .{ V("D"), .{T("q")} },
-            .{ V("Q"), .{T("z")} },
+            .{ V("D"), .{ T("q") } },
+            .{ V("Q"), .{ T("z") } },
         },
         V("S"),
         T("$"),
@@ -1295,13 +1296,13 @@ test "first_and_follows [custom4]" {
 
     const first_set_comptime = comptime grammar.getFirstSetComptime();
 
-    const expected_first_set = comptime firstTableFromTuples(.{
-        .{ V("S"), .{ T("c"), T("a"), T("z"), V("A"), V("Q") } },
-        .{ V("A"), .{ T("c"), T("a"), T("z"), V("Q") } },
-        .{ V("B"), .{ T("c"), T("a"), T("z"), T("q"), V("C"), V("A"), V("Q"), V("D") } },
-        .{ V("C"), .{ T("c"), T("a"), T("z"), T("q"), V("A"), V("Q"), V("D") } },
-        .{ V("D"), .{T("q")} },
-        .{ V("Q"), .{T("z")} },
+    const expected_first_set = comptime followTableFromTuples(.{
+        .{ V("S"), .{ T("c"), T("a"), T("z") } },
+        .{ V("A"), .{ T("c"), T("a"), T("z") } },
+        .{ V("B"), .{ T("c"), T("a"), T("z"), T("q") } },
+        .{ V("C"), .{ T("c"), T("a"), T("z"), T("q") } },
+        .{ V("D"), .{ T("q") } },
+        .{ V("Q"), .{ T("z") } },
     }, TestVariable, TestTerminal, grammar);
 
     try std.testing.expectEqualSlices(bool, &expected_first_set, first_set);
@@ -1338,10 +1339,10 @@ test "first_and_follows [custom5]" {
 
     const first_set_comptime = comptime grammar.getFirstSetComptime();
 
-    const expected_first_set = comptime firstTableFromTuples(.{
-        .{ V("S"), .{ T("q"), V("A"), V("B") } },
-        .{ V("A"), .{ T("q"), V("A"), V("B") } },
-        .{ V("B"), .{ T("q"), V("A"), V("B") } },
+    const expected_first_set = comptime followTableFromTuples(.{
+        .{ V("S"), .{ T("q") } },
+        .{ V("A"), .{ T("q") } },
+        .{ V("B"), .{ T("q") } },
     }, TestVariable, TestTerminal, grammar);
 
     try std.testing.expectEqualSlices(bool, &expected_first_set, first_set);
