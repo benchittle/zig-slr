@@ -10,8 +10,11 @@ const utils = @import("utils.zig");
 /// terminal).
 pub const SymbolId = union(enum) {
     const Self = @This();
+    // TODO: make this a single ID type
     const VariableId = u16;
     const TerminalId = u16;
+
+    pub const ID_MAX = std.math.maxInt(VariableId);
 
     variable_id: VariableId,
     terminal_id: TerminalId,
@@ -56,23 +59,6 @@ pub const Production = struct {
 
         return true;
     }
-
-    /// Used for sorting productions so that those with a variable as the first
-    /// symbol on the right of the production appear before those with a
-    /// terminal as the first symbol. Each group is then also ordered by ID of
-    /// the variable on the left side.
-    fn lessThan(_: void, this: Self, other: Self) bool {
-        return switch(this.rhs[0]) {
-            .variable_id => switch (other.rhs[0]) {
-                .variable_id => this.lhs < other.lhs,
-                .terminal_id => true,
-            },
-            .terminal_id => switch(other.rhs[0]) {
-                .variable_id => false,
-                .terminal_id => this.lhs < other.lhs,
-            }
-        };
-    }
 };
 
 /// Representation of a formal grammar for a language.
@@ -100,13 +86,48 @@ pub const Production = struct {
 ///   The end terminal will always be assigned the final terminal symbol ID.
 pub fn Grammar(comptime Variable: type, comptime Terminal: type) type {
     return struct {
-        const Self = @This();
-        pub const NfaState = usize;
+        const GrammarType = @This();
 
-        // TODO: make this a ragged array (i.e. all productions sharing one
-        // block of memory instead of rhs pointing to other blocks)
-        rules: []const Production,
-        state_count: usize,
+        pub const NfaView = struct {
+            pub const State = usize;
+
+            grammar: *const GrammarType,
+
+            /// Returns the number of states in the grammar's e-NFA
+            /// representation.
+            pub fn stateCount(self: NfaView) usize {
+                return self.grammar.rules_rhs.data.len;
+            }
+
+            /// Returns the SymbolId being read in the given e-NFA state, or
+            /// null if the state is the last state in a rule.
+            pub fn symbolIdFromState(self: NfaView, state: State) ?SymbolId {
+                const symbol_id = self.grammar.rules_rhs.data[state];
+                if (GrammarType.SENTINEL.eql(symbol_id)) {
+                    return null;
+                }
+                return symbol_id;
+            }
+
+            /// Finds the rule containing the given state and returns its ID.
+            pub fn ruleIdFromState(self: NfaView, state: State) usize {
+                return self.grammar.rules_rhs.findRow(state);
+            }
+
+            /// Returns the first e-NFA state for the given rule.
+            pub fn firstStateFromRuleId(self: NfaView, rule_id: usize) State {
+                return self.grammar.rules_rhs.row_offsets[rule_id];
+            }
+        };
+
+        // TODO: If we could encode the row number into the sentinel values,
+        // we could skip the reverse index on the ragged array
+        pub const SENTINEL = SymbolId{ .variable_id = SymbolId.ID_MAX };
+
+        rules_lhs: []const SymbolId.VariableId,
+        // NOTE: there is a gap of size SymbolId between each rule so that this
+        //       lines up with the NFA states
+        rules_rhs: utils.RaggedArray(SymbolId, true),
         variables: []const Variable,
         terminals: []const Terminal,
 
@@ -121,85 +142,129 @@ pub fn Grammar(comptime Variable: type, comptime Terminal: type) type {
             // to guqrantee no multiple start paths
             comptime rule_tuples: anytype,
             comptime start_variable: Variable,
-            comptime end_terminal: Terminal
-        ) Self {
+            comptime end_terminal: Terminal,
+        ) GrammarType {
             comptime {
-                // Initialize a grammar struct to populate.
-                var grammar = Self{
-                    .rules = &[_]Production{},
-                    .state_count = 0,
-                    .variables = &[_]Variable{start_variable},
-                    .terminals = &[_]Terminal{},
-                };
-
                 // Throws a compiler error if the structure or types of the
                 // given tuples are invalid.
                 verifyTuples(rule_tuples);
 
-                // Iterate over each rule tuple and populate our grammar rules.
-                for (rule_tuples) |rule_tuple| {
-                    // Initialize a rule struct to populate.
-                    var rule = Production{
-                        .lhs = undefined,
-                        .rhs = &[_]SymbolId{},
-                    };
+                var rules_lhs: [rule_tuples.len]SymbolId.VariableId = undefined;
+                var rules_rhs: [rule_tuples.len][]const SymbolId = undefined;
+                var variables: []const Variable = &[_]Variable{start_variable};
+                var terminals: []const Terminal = &[_]Terminal{};
+                var nfa_state_count = 0;
 
+                // Iterate over each rule tuple and populate our grammar rules.
+                for (rule_tuples, 0..) |rule_tuple, i| {
                     // Unpack the left hand side of the rule. We have already
                     // checked that it is of type Variable.
                     const lhs = rule_tuple.@"0";
-                    if (grammar.getSymbolIdFromVariable(lhs)) |id| {
-                        rule.lhs = id.variable_id;
+                    if (getSymbolIdFromVariableSlice(lhs, variables)) |v| {
+                        rules_lhs[i] = v.variable_id;
                     } else {
                         // If we haven't seen this variable yet, append it to
                         // the variables list.
-                        rule.lhs = grammar.getVariableCount();
-                        grammar.variables = grammar.variables ++ &[_]Variable{lhs};
+                        rules_lhs[i] = @intCast(variables.len);
+                        variables = variables ++ &[_]Variable{lhs};
+                        if (variables.len == SymbolId.ID_MAX) {
+                            @compileError("Too many variables");
+                        }
                     }
 
                     // Iterate over the symbols on the right hand side of the
                     // rule tuple and unpack each into the grammar rule.
                     const rhs = rule_tuple.@"1";
-                    for (std.meta.fieldNames(@TypeOf(rhs))) |rhs_tuple_field_name| {
+                    var rhs_symbols: [rhs.len + 1]SymbolId = undefined;
+                    for (std.meta.fieldNames(@TypeOf(rhs)), 0..) |rhs_tuple_field_name, j| {
                         const var_or_terminal = @field(rhs, rhs_tuple_field_name);
                         if (@TypeOf(var_or_terminal) == Variable) {
-                            if (grammar.getSymbolIdFromVariable(var_or_terminal)) |symbol| {
-                                rule.rhs = rule.rhs ++ &[_]SymbolId{symbol};
+                            if (getSymbolIdFromVariableSlice(var_or_terminal, variables)) |v| {
+                                rhs_symbols[j] = v;
                             } else {
                                 // If we haven't seen this variable yet, append
                                 // it to the variables list.
-                                rule.rhs = rule.rhs ++ &[_]SymbolId{SymbolId{ .variable_id = grammar.getVariableCount() }};
-                                grammar.variables = grammar.variables ++ &[_]Variable{var_or_terminal};
+                                rhs_symbols[j] = .{ .variable_id = variables.len };
+                                variables = variables ++ &[_]Variable{var_or_terminal};
+                                if (variables.len == SymbolId.ID_MAX) {
+                                    @compileError("Too many variables");
+                                }
                             }
-                        } else {
-                            if (grammar.getSymbolIdFromTerminal(var_or_terminal)) |symbol| {
-                                rule.rhs = rule.rhs ++ &[_]SymbolId{symbol};
+                        } else if (@TypeOf(var_or_terminal) == Terminal) {
+                            if (getSymbolIdFromTerminalSlice(var_or_terminal, terminals)) |t| {
+                                rhs_symbols[j] = t;
                             } else {
                                 // If we haven't seen this terminal yet, append
                                 // it to the terminals list.
-                                rule.rhs = rule.rhs ++ &[_]SymbolId{SymbolId{ .terminal_id = grammar.getTerminalCount() }};
-                                grammar.terminals = grammar.terminals ++ &[_]Terminal{var_or_terminal};
+                                rhs_symbols[j] = .{ .terminal_id = terminals.len };
+                                terminals = terminals ++ &[_]Terminal{var_or_terminal};
+                                if (terminals.len > SymbolId.ID_MAX) {
+                                    @compileError("Too many terminals");
+                                }
                             }
+                        } else {
+                            @compileError("Unexpected type in rhs (expected Variable or Terminal)");
                         }
                     }
-                    // Append the populated rule.
-                    grammar.rules = grammar.rules ++ &[_]Production{rule};
-                    grammar.state_count += rule.rhs.len + 1;
+                    nfa_state_count += rhs.len + 1;
+                    rhs_symbols[rhs_symbols.len - 1] = SENTINEL;
+                    rules_rhs[i] = &rhs_symbols;
                 }
-                grammar.terminals = grammar.terminals ++ &[_]Terminal{end_terminal};
+                terminals = terminals ++ &[_]Terminal{end_terminal};
+                if (terminals.len > SymbolId.ID_MAX) {
+                    @compileError("Too many terminals");
+                }
 
-                // Kind of hacky workaround to be able to sort the rules after
-                // we have them.
-                var rules: [grammar.rules.len]Production = undefined;
-                std.mem.copyForwards(Production, &rules, grammar.rules);
-                std.mem.sortUnstable(Production, &rules, {}, Production.lessThan);
-                const sorted_rules = rules;
-                grammar.rules = &sorted_rules;
+                // Sort rules
+                const SortContext = struct {
+                    rules_lhs_: []SymbolId.VariableId,
+                    rules_rhs_: [][]const SymbolId,
 
-                return grammar;
+                    /// Productions with a variable as the first symbol on the
+                    /// right of the production should appear before those with
+                    /// a terminal as the first symbol. Each group should then
+                    /// be ordered by ID of the variable on the left side.
+                    pub fn lessThan(self: @This(), a: usize, b: usize) bool {
+                        return switch (self.rules_rhs_[a][0]) {
+                            .variable_id => switch (self.rules_rhs_[b][0]) {
+                                .variable_id => self.rules_lhs_[a] < self.rules_lhs_[b],
+                                .terminal_id => true,
+                            },
+                            .terminal_id => switch (self.rules_rhs_[b][0]) {
+                                .variable_id => false,
+                                .terminal_id => self.rules_lhs_[a] < self.rules_lhs_[b],
+                            },
+                        };
+                    }
+
+                    pub fn swap(self: @This(), a: usize, b: usize) void {
+                        std.mem.swap(SymbolId.VariableId, &self.rules_lhs_[a], &self.rules_lhs_[b]);
+                        std.mem.swap([]const SymbolId, &self.rules_rhs_[a], &self.rules_rhs_[b]);
+                    }
+                };
+                std.sort.pdqContext(0, rule_tuples.len, SortContext{ .rules_lhs_ = &rules_lhs, .rules_rhs_ = &rules_rhs });
+
+                // Convert the rhs array of slices to a ragged array.
+                const RaggedArrayBuilder = utils.RaggedArray(SymbolId, true).RaggedArrayBuilder;
+                var builder = RaggedArrayBuilder.initWithCapacityComptime(nfa_state_count, rule_tuples.len);
+                for (rules_rhs) |rhs| {
+                    for (rhs) |symbol| {
+                        builder.appendAssumeCapacity(symbol);
+                    }
+                    builder.startNextRowAssumeCapacity();
+                }
+
+                const rules_lhs_final = rules_lhs;
+                return .{
+                    .rules_lhs = &rules_lhs_final,
+                    .rules_rhs = builder.build(),
+                    .terminals = terminals,
+                    .variables = variables,
+                };
             }
         }
 
-        pub fn deinit(self: Self, allocator: std.mem.Allocator) void {
+        pub fn deinit(self: GrammarType, allocator: std.mem.Allocator) void {
             allocator.free(self.rules);
             allocator.free(self.variables);
             allocator.free(self.terminals);
@@ -270,42 +335,40 @@ pub fn Grammar(comptime Variable: type, comptime Terminal: type) type {
             }
         }
 
-        pub fn getStateCount(self: Self) usize {
-            return self.state_count;
+        pub fn nfa(self: *const GrammarType) NfaView {
+            return NfaView{ .grammar = self };
         }
 
-        pub fn getRuleId(self: Self, rule: Production) ?usize {
-            for (self.rules, 0..) |known_rule, i| {
-                if (known_rule.eql(rule)) {
-                    return i;
-                }
-            }
-            return null;
-        }
-
-        pub fn getVariableCount(self: Self) SymbolId.VariableId {
+        // TODO: enforce maximums based on SymbolId.type
+        // TODO: remove "get" from some of these
+        pub fn getVariableCount(self: GrammarType) SymbolId.VariableId {
             return @intCast(self.variables.len);
         }
 
-        pub fn getTerminalCount(self: Self) SymbolId.TerminalId {
+        pub fn getTerminalCount(self: GrammarType) SymbolId.TerminalId {
             return @intCast(self.terminals.len);
         }
 
-        pub fn getSymbolCount(self: Self) usize {
+        pub fn getSymbolCount(self: GrammarType) usize {
             return self.getVariableCount() + self.getTerminalCount();
         }
 
-        pub fn getSymbolIdFromVariable(self: Self, variable: Variable) ?SymbolId {
-            for (self.variables, 0..) |v, variable_id| {
-                if (variable.eql(v)) {
-                    return SymbolId{ .variable_id = @intCast(variable_id) };
+        // HashMap for this? Parser will need it anyway...
+        fn getSymbolIdFromVariableSlice(variable: Variable, slice: []const Variable) ?SymbolId {
+            for (slice, 0..) |other_variable, v_id| {
+                if (variable.eql(other_variable)) {
+                    return SymbolId{ .variable_id = @intCast(v_id) };
                 }
             }
             return null;
         }
 
-        pub fn getSymbolIdFromTerminal(self: Self, terminal: Terminal) ?SymbolId {
-            for (self.terminals, 0..) |t, terminal_id| {
+        pub fn getSymbolIdFromVariable(self: GrammarType, variable: Variable) ?SymbolId {
+            return getSymbolIdFromVariableSlice(variable, self.variables);
+        }
+
+        fn getSymbolIdFromTerminalSlice(terminal: Terminal, slice: []const Terminal) ?SymbolId {
+            for (slice, 0..) |t, terminal_id| {
                 if (terminal.eql(t)) {
                     return SymbolId{ .terminal_id = @intCast(terminal_id) };
                 }
@@ -313,22 +376,36 @@ pub fn Grammar(comptime Variable: type, comptime Terminal: type) type {
             return null;
         }
 
-        pub fn getStartSymbolId(_: Self) SymbolId {
+        pub fn getSymbolIdFromTerminal(self: GrammarType, terminal: Terminal) ?SymbolId {
+            return getSymbolIdFromTerminalSlice(terminal, self.terminals);
+        }
+
+        pub fn getStartSymbolId(_: GrammarType) SymbolId {
             return SymbolId{ .variable_id = 0 };
         }
 
-        pub fn getEndSymbolId(self: Self) SymbolId {
+        pub fn getEndSymbolId(self: GrammarType) SymbolId {
             return SymbolId{ .terminal_id = self.getTerminalCount() - 1 };
         }
 
         // TODO: Need to make sure things still work if we have multiple start
         // rules (e.g. S->A|B) OR limit to a single production for start rule
-        pub fn getStartRuleId(_: Self) usize {
+        // TODO: define RuleId type alias, make it u16 or something reasonable,
+        //       reject bigger
+        pub fn getStartRuleId(_: GrammarType) usize {
             return 0;
         }
 
-        pub fn getRule(self: Self, rule_id: usize) Production {
-            return self.rules[rule_id];
+        // TODO: individual field access would probably be faster than assembling
+        //   a temp rule here (maybe look at disassembly and see what optimizer does?)
+        pub fn getRule(self: GrammarType, rule_id: usize) Production {
+            std.debug.assert(rule_id < self.rules_lhs.len);
+            const row = self.rules_rhs.row(rule_id);
+            return .{ .lhs = self.rules_lhs[rule_id], .rhs = row[0 .. row.len - 1] };
+        }
+
+        pub fn ruleCount(self: GrammarType) usize {
+            return self.rules_lhs.len;
         }
 
         // TODO: optimize: use tarjan's scc algorithm
@@ -337,7 +414,7 @@ pub fn Grammar(comptime Variable: type, comptime Terminal: type) type {
         // second stack or map maintained or sth?
 
         // TODO: FOR DFS: theoretically only rquires one Symbol.VariableType
-        // to store path_branches
+        // to store path_branches  === std.BITSTACK
         // e.g. for a flat tree it would be 1|11111...11111
         //    or for a larger graph it might be 1111|1111|11111...
         // and for a line it would be 1|1|1|1|...|1
@@ -348,12 +425,11 @@ pub fn Grammar(comptime Variable: type, comptime Terminal: type) type {
         // and also reduce some wasted allocations (e.g. populated does not
         // still need to be allocated when assembling the final closure lists)
 
-
         /// Caller must free returned RaggedArray
         pub fn computeEpsilonClosures(
-            self: Self,
+            self: GrammarType,
             allocator: std.mem.Allocator,
-        ) !utils.RaggedArray(NfaState) {
+        ) !utils.RaggedArray(NfaView.State, false) {
             var first_var_edge_list_offsets = try allocator.alloc(
                 usize,
                 self.getVariableCount() + 1,
@@ -386,7 +462,8 @@ pub fn Grammar(comptime Variable: type, comptime Terminal: type) type {
             // graph simply by iterating until we reach the first rule whose rhs
             // starts with a terminal (guaranteeing we've passed all rules whose
             // rhs starts with a variable).
-            const total_edge_count = ret: for (self.rules, 0..) |rule, i| {
+            const total_edge_count = ret: for (0..self.ruleCount()) |i| {
+                const rule = self.getRule(i);
                 switch (rule.rhs[0]) {
                     .terminal_id => break :ret i,
                     .variable_id => continue,
@@ -395,9 +472,10 @@ pub fn Grammar(comptime Variable: type, comptime Terminal: type) type {
 
             // Populate first_var_edge_list_offsets as described above.
             {
-                var current_key = self.rules[0].lhs;
+                var current_key = self.getRule(0).lhs;
                 var offset: usize = 0;
-                for (self.rules[1..total_edge_count], 1..) |rule, i| {
+                for (1..total_edge_count) |i| {
+                    const rule = self.getRule(i);
                     if (current_key != rule.lhs) {
                         offset = i;
                         current_key = rule.lhs;
@@ -424,7 +502,7 @@ pub fn Grammar(comptime Variable: type, comptime Terminal: type) type {
                 for (1..first_var_edge_list_offsets.len) |i| {
                     const node_id = first_var_edge_list_offsets.len - i - 1;
                     const offset = first_var_edge_list_offsets[node_id];
-                    if (self.rules[offset].lhs != node_id) {
+                    if (self.getRule(offset).lhs != node_id) {
                         first_var_edge_list_offsets[node_id] = last_offset;
                     } else {
                         last_offset = offset;
@@ -432,29 +510,21 @@ pub fn Grammar(comptime Variable: type, comptime Terminal: type) type {
                 }
             }
 
-            // Maps each grammar rule to the first e-NFA state of its RHS.
-            var rule_first_state_map = try allocator.alloc(NfaState, self.rules.len);
-            defer allocator.free(rule_first_state_map);
-            rule_first_state_map[0] = 0;
-            for (1..self.rules.len) |i| {
-                const previous_rule_last_state = rule_first_state_map[i - 1] + self.rules[i - 1].rhs.len;
-                rule_first_state_map[i] = previous_rule_last_state + 1;
-            }
-
             // Stores the e-NFA states reachable when reading a given grammar
             // variable. Each row represents a grammar variable, and each column
             // represents an e-NFA state (only the states stored in
             // rule_first_state_map are considered).
             var closure_table = utils.Slice2d([]bool).init(
-                try allocator.alloc(bool, self.getVariableCount() * self.rules.len),
-                self.rules.len,
+                try allocator.alloc(bool, self.getVariableCount() * self.ruleCount()),
+                self.ruleCount(),
             );
             defer allocator.free(closure_table.slice);
             @memset(closure_table.slice, false);
 
             // Seed first_closure_table with the state(s) directly reachable
             // from each grammar variable.
-            for (self.rules, 0..) |rule, i| {
+            for (0..self.ruleCount()) |i| {
+                const rule = self.getRule(i);
                 closure_table.row(rule.lhs)[i] = true;
             }
 
@@ -467,6 +537,7 @@ pub fn Grammar(comptime Variable: type, comptime Terminal: type) type {
             var populated = try allocator.alloc(bool, self.getVariableCount());
             defer allocator.free(populated);
             @memset(populated, false);
+            const nfa_view = self.nfa();
 
             // Now to solve the actual problem at hand: computing the epsilon
             // closure for each grammar variable.
@@ -499,7 +570,7 @@ pub fn Grammar(comptime Variable: type, comptime Terminal: type) type {
                         if (edges_explored < edge_count) {
                             // Get the node from the next unexplored edge.
                             const next_index = first_var_edge_list_offsets[current_node] + edges_explored;
-                            const next_node = self.rules[next_index].rhs[0].variable_id;
+                            const next_node = self.getRule(next_index).rhs[0].variable_id;
                             path_edges_explored[current_node] += 1;
 
                             // Avoid loops.
@@ -538,47 +609,42 @@ pub fn Grammar(comptime Variable: type, comptime Terminal: type) type {
             }
 
             // Convert closure_table to a ragged array. //
-
-            // First determine the row offsets and total length for the ragged
-            // array.
-            var closure_lists_offsets = try allocator.alloc(usize, self.getVariableCount() + 1);
-            errdefer allocator.free(closure_lists_offsets);
-            closure_lists_offsets[0] = 0;
-            for (0..self.getVariableCount()) |var_id| {
-                closure_lists_offsets[var_id + 1] = closure_lists_offsets[var_id];
-                for (closure_table.row(var_id)) |is_in_closure| {
-                    if (is_in_closure) {
-                        closure_lists_offsets[var_id + 1] += 1;
-                    }
-                }
-            }
-
-            var closure_lists = utils.RaggedArray(NfaState).init(
-                try allocator.alloc(
-                    NfaState,
-                    closure_lists_offsets[closure_lists_offsets.len - 1],
-                ),
-                closure_lists_offsets,
-            );
-            errdefer allocator.free(closure_lists.data);
-
-            // Populate the ragged array.
-            for (0..self.getVariableCount()) |var_id| {
+            // TODO: consider doing this without iterating everything twice?
+            //       could track size earlier, or add dynamic appends to builder
+            var it = closure_table.iterRows();
+            const element_count = ret: {
                 var count: usize = 0;
-                for (closure_table.row(var_id), 0..) |is_in_closure, rule_id| {
-                    if (is_in_closure) {
-                        closure_lists.row(var_id)[count] = rule_first_state_map[rule_id];
-                        count += 1;
+                while (it.next()) |row| {
+                    for (row) |is_in_table| {
+                        count += @intFromBool(is_in_table);
                     }
                 }
+                break :ret count;
+            };
+            const RaggedArrayBuilder = utils.RaggedArray(NfaView.State, false).RaggedArrayBuilder;
+            var builder = switch (@inComptime()) {
+                true => RaggedArrayBuilder.initWithCapacityComptime(element_count, closure_table.rowCount()),
+                false => try RaggedArrayBuilder.initWithCapacity(allocator, element_count, closure_table.rowCount()),
+            };
+            errdefer if (@inComptime()) builder.deinit(allocator);
+
+            it.reset();
+            while (it.next()) |row| {
+                for (row, 0..) |is_in_table, i| {
+                    if (is_in_table) {
+                        const state = nfa_view.firstStateFromRuleId(i);
+                        builder.appendAssumeCapacity(state);
+                    }
+                }
+                builder.startNextRowAssumeCapacity();
             }
 
-            return closure_lists;
+            return builder.build();
         }
 
         /// Caller must free the returned slice.
         fn computeFirstSet(
-            self: Self,
+            self: GrammarType,
             allocator: std.mem.Allocator,
         ) ![]bool {
             var first_set_table = utils.Slice2d([]bool).init(
@@ -592,26 +658,13 @@ pub fn Grammar(comptime Variable: type, comptime Terminal: type) type {
             @memset(first_set_table.slice, false);
 
             var closures = try self.computeEpsilonClosures(allocator);
-            defer closures.deinit(allocator);
+            defer if (!@inComptime()) closures.deinit(allocator);
 
-            var nfa_state_to_rule_map = try allocator.alloc(usize, self.state_count);
-            defer allocator.free(nfa_state_to_rule_map);
-            {
-                var nfa_state: NfaState = 0;
-                for (self.rules, 0..) |rule, rule_id| {
-                    for (rule.rhs) |_| {
-                        nfa_state_to_rule_map[nfa_state] = rule_id;
-                        nfa_state += 1;
-                    }
-                    nfa_state_to_rule_map[nfa_state] = rule_id;
-                    nfa_state += 1;
-                }
-            }
-
+            const nfa_view = self.nfa();
             for (0..self.getVariableCount()) |var_id| {
                 for (closures.row(var_id)) |nfa_state| {
-                    const rule_from_state = self.rules[nfa_state_to_rule_map[nfa_state]];
-                    const first_symbol = rule_from_state.rhs[0];
+                    const rule_id = nfa_view.ruleIdFromState(nfa_state);
+                    const first_symbol = self.getRule(rule_id).rhs[0];
                     switch (first_symbol) {
                         .terminal_id => |id| first_set_table.row(var_id)[id] = true,
                         .variable_id => {},
@@ -635,12 +688,12 @@ pub fn Grammar(comptime Variable: type, comptime Terminal: type) type {
         /// described above. Caller must free.
         ///
         /// NOTE: $ (END character) can never be first
-        pub fn getFirstSet(self: Self, allocator: std.mem.Allocator) ![]bool {
+        pub fn getFirstSet(self: GrammarType, allocator: std.mem.Allocator) ![]bool {
             return self.computeFirstSet(allocator);
         }
 
         /// Comptime version of `getFirstSet()`, no dynamic allocation needed.
-        pub fn getFirstSetComptime(comptime self: Self) []bool {
+        pub fn getFirstSetComptime(comptime self: GrammarType) []bool {
             comptime return self.computeFirstSet(comptime_allocator.comptime_allocator) catch unreachable;
         }
 
@@ -652,7 +705,7 @@ pub fn Grammar(comptime Variable: type, comptime Terminal: type) type {
         /// `follow_set` is populated with the resulting table, the other buffers
         /// can be freed immediately if they were dynamically allocated.
         fn computeFollowSet(
-            self: Self,
+            self: GrammarType,
             follow_set: utils.Slice2d([]bool),
             first_set: utils.Slice2d([]const bool),
         ) void {
@@ -668,7 +721,8 @@ pub fn Grammar(comptime Variable: type, comptime Terminal: type) type {
             // across a variable, look at the next symbol: if its a terminal,
             // add it to the variable's FOLLOW set; if it's another variable,
             // union its FIRST set into the current variable's FOLLOW set.
-            for (self.rules) |rule| {
+            for (0..self.ruleCount()) |i| {
+                const rule = self.getRule(i);
                 for (rule.rhs[0..(rule.rhs.len - 1)], rule.rhs[1..rule.rhs.len]) |symbol_id, next_symbol_id| {
                     switch (symbol_id) {
                         .terminal_id => continue,
@@ -676,14 +730,15 @@ pub fn Grammar(comptime Variable: type, comptime Terminal: type) type {
                             .terminal_id => |next_t_id| follow_set.row(v_id)[next_t_id] = true,
                             // TODO: first set is now different row length, should add a check for this in sliceUnion!!!
                             .variable_id => |next_v_id| utils.sliceUnion(follow_set.row(v_id), first_set.row(next_v_id)),
-                        }
+                        },
                     }
                 }
             }
 
             // Propagate FOLLOW sets for any productions whose rhs ends with a
             // variable.
-            for (self.rules) |rule| {
+            for (0..self.ruleCount()) |i| {
+                const rule = self.getRule(i);
                 const end_v_id = switch (rule.rhs[rule.rhs.len - 1]) {
                     .terminal_id => continue,
                     .variable_id => |v_id| v_id,
@@ -704,7 +759,7 @@ pub fn Grammar(comptime Variable: type, comptime Terminal: type) type {
         /// NOTE: Assumes $ is last terminal symbol ID and S' is the first
         ///       symbol ID (0). FOLLOW(S') will be initialized to {$}, which
         ///       will then be propogated as needed.
-        pub fn getFollowSet(self: Self, allocator: std.mem.Allocator, first_set: utils.Slice2d([]const bool)) ![]bool {
+        pub fn getFollowSet(self: GrammarType, allocator: std.mem.Allocator, first_set: utils.Slice2d([]const bool)) ![]bool {
             const follow_set_buffer = try allocator.alloc(bool, self.getVariableCount() * self.getTerminalCount());
             errdefer allocator.free(follow_set_buffer);
 
@@ -716,7 +771,7 @@ pub fn Grammar(comptime Variable: type, comptime Terminal: type) type {
         }
 
         /// Comptime version of `getFollowSet()`, no dynamic allocation needed.
-        pub fn getFollowSetComptime(comptime self: Self, first_set: utils.Slice2d([]const bool)) [self.getVariableCount() * self.getTerminalCount()]bool {
+        pub fn getFollowSetComptime(comptime self: GrammarType, first_set: utils.Slice2d([]const bool)) [self.getVariableCount() * self.getTerminalCount()]bool {
             comptime {
                 var follow_set_buffer: [self.getVariableCount() * self.getTerminalCount()]bool = undefined;
 
@@ -731,25 +786,13 @@ pub fn Grammar(comptime Variable: type, comptime Terminal: type) type {
 }
 
 test "Grammar.initFromTuples [grammar1.0]" {
-    // R0: S   -> wff
-    // R1: wff -> Proposition
-    // R2: wff -> Not    wff
-    // R3: wff -> LParen wff And    wff RParen
-    // R4: wff -> LParen wff Or     wff RParen
-    // R5: wff -> LParen wff Cond   wff RParen
-    // R6: wff -> LParen wff Bicond wff RParen
-
-    const V_S = 0;
-    const V_WFF = 1;
-    const T_PROPOSITION = 0;
-    const T_NOT = 1;
-    const T_LPAREN = 2;
-    const T_AND = 3;
-    const T_RPAREN = 4;
-    const T_OR = 5;
-    const T_COND = 6;
-    const T_BICOND = 7;
-    // $ = 10
+    // R0: S   ->  (0) wff (1)
+    // R1: wff ->  (2) Proposition (3)
+    // R2: wff ->  (4) Not     (5) wff  (6)
+    // R3: wff ->  (7) LParen  (8) wff  (9) And    (10) wff (11) RParen (12)
+    // R4: wff -> (13) LParen (14) wff (15) Or     (16) wff (17) RParen (18)
+    // R5: wff -> (19) LParen (20) wff (21) Cond   (22) wff (23) RParen (24)
+    // R6: wff -> (25) LParen (26) wff (27) Bicond (28) wff (29) RParen (30)
 
     const TestVariable = test_common.TestVariable;
     const TestTerminal = test_common.TestWffTerminal;
@@ -758,8 +801,8 @@ test "Grammar.initFromTuples [grammar1.0]" {
     const G = Grammar(TestVariable, TestTerminal);
     const actual_grammar = comptime G.initFromTuples(
         .{
-            .{ V("S"), .{V("wff")} },
-            .{ V("wff"), .{ TestTerminal.Proposition} },
+            .{ V("S"), .{ V("wff") } },
+            .{ V("wff"), .{ TestTerminal.Proposition } },
             .{ V("wff"), .{ TestTerminal.Not, V("wff") } },
             .{ V("wff"), .{ TestTerminal.LParen, V("wff"), TestTerminal.And, V("wff"), TestTerminal.RParen } },
             .{ V("wff"), .{ TestTerminal.LParen, V("wff"), TestTerminal.Or, V("wff"), TestTerminal.RParen } },
@@ -770,54 +813,87 @@ test "Grammar.initFromTuples [grammar1.0]" {
         TestTerminal.End,
     );
 
-    const r0 = Production{ .lhs = V_S, .rhs = &[_]SymbolId{.{ .variable_id = V_WFF }} };
-    const r1 = Production{ .lhs = V_WFF, .rhs = &[_]SymbolId{.{ .terminal_id = T_PROPOSITION }} };
-    const r2 = Production{ .lhs = V_WFF, .rhs = &[_]SymbolId{ .{ .terminal_id = T_NOT }, .{ .variable_id = V_WFF } } };
-    const r3 = Production{ .lhs = V_WFF, .rhs = &[_]SymbolId{ .{ .terminal_id = T_LPAREN }, .{ .variable_id = V_WFF }, .{ .terminal_id = T_AND }, .{ .variable_id = V_WFF }, .{ .terminal_id = T_RPAREN } } };
-    const r4 = Production{ .lhs = V_WFF, .rhs = &[_]SymbolId{ .{ .terminal_id = T_LPAREN }, .{ .variable_id = V_WFF }, .{ .terminal_id = T_OR }, .{ .variable_id = V_WFF }, .{ .terminal_id = T_RPAREN } } };
-    const r5 = Production{ .lhs = V_WFF, .rhs = &[_]SymbolId{ .{ .terminal_id = T_LPAREN }, .{ .variable_id = V_WFF }, .{ .terminal_id = T_COND }, .{ .variable_id = V_WFF }, .{ .terminal_id = T_RPAREN } } };
-    const r6 = Production{ .lhs = V_WFF, .rhs = &[_]SymbolId{ .{ .terminal_id = T_LPAREN }, .{ .variable_id = V_WFF }, .{ .terminal_id = T_BICOND }, .{ .variable_id = V_WFF }, .{ .terminal_id = T_RPAREN } } };
+    const V_S = SymbolId{ .variable_id = 0 };
+    const V_WFF = SymbolId{ .variable_id = 1 };
+    const V_SENTINEL = G.SENTINEL;
+    const T_PROPOSITION = SymbolId{ .terminal_id = 0 };
+    const T_NOT = SymbolId{ .terminal_id = 1 };
+    const T_LPAREN = SymbolId{ .terminal_id = 2 };
+    const T_AND = SymbolId{ .terminal_id = 3 };
+    const T_RPAREN = SymbolId{ .terminal_id = 4 };
+    const T_OR = SymbolId{ .terminal_id = 5 };
+    const T_COND = SymbolId{ .terminal_id = 6 };
+    const T_BICOND = SymbolId{ .terminal_id = 7 };
+    // $ = 10
 
-    const expected_grammar = G{
-        .rules = &[_]Production{ r0, r1, r2, r3, r4, r5, r6 },
-        .state_count = 31,
-        .variables = &[_]TestVariable{ V("S"), V("wff") },
-        .terminals = &[_]TestTerminal{ TestTerminal.Proposition, TestTerminal.Not, TestTerminal.LParen, TestTerminal.And, TestTerminal.RParen, TestTerminal.Or, TestTerminal.Cond, TestTerminal.Bicond, TestTerminal.End },
+    const rules_lhs = [_]SymbolId.VariableId{
+        V_S.variable_id,
+        V_WFF.variable_id,
+        V_WFF.variable_id,
+        V_WFF.variable_id,
+        V_WFF.variable_id,
+        V_WFF.variable_id,
+        V_WFF.variable_id,
     };
 
-    try std.testing.expectEqualDeep(expected_grammar.rules, actual_grammar.rules);
+    const rules_rhs = [_]SymbolId{
+        V_WFF, V_SENTINEL,
+        T_PROPOSITION, V_SENTINEL,
+        T_NOT, V_WFF, V_SENTINEL,
+        T_LPAREN, V_WFF, T_AND, V_WFF, T_RPAREN,V_SENTINEL,
+        T_LPAREN, V_WFF, T_OR, V_WFF, T_RPAREN, V_SENTINEL,
+        T_LPAREN, V_WFF, T_COND, V_WFF, T_RPAREN, V_SENTINEL,
+        T_LPAREN, V_WFF, T_BICOND, V_WFF, T_RPAREN, V_SENTINEL,
+    };
+
+    const offsets = [_]usize{ 0, 2, 4, 7, 13, 19, 25, 31 };
+
+    const index_to_row_map = [_]usize{
+        0, 0,
+        1, 1,
+        2, 2, 2,
+        3, 3, 3, 3, 3, 3,
+        4, 4, 4, 4, 4, 4,
+        5, 5, 5, 5, 5, 5,
+        6, 6, 6, 6, 6, 6,
+    };
+
+    const expected_grammar = G{
+        .rules_lhs = &rules_lhs,
+        .rules_rhs = utils.RaggedArray(SymbolId, true){
+            .data = &rules_rhs,
+            .row_offsets = &offsets,
+            .index_to_row_map = &index_to_row_map,
+        },
+        .variables = &[_]TestVariable{ V("S"), V("wff") },
+        .terminals = &[_]TestTerminal{
+            TestTerminal.Proposition, TestTerminal.Not,    TestTerminal.LParen,
+            TestTerminal.And,         TestTerminal.RParen, TestTerminal.Or,
+            TestTerminal.Cond,        TestTerminal.Bicond, TestTerminal.End
+        },
+    };
+
+    try std.testing.expectEqualDeep(expected_grammar.rules_lhs, actual_grammar.rules_lhs);
+    try std.testing.expectEqualDeep(expected_grammar.rules_rhs.data, actual_grammar.rules_rhs.data);
+    try std.testing.expectEqualDeep(expected_grammar.rules_rhs.row_offsets, actual_grammar.rules_rhs.row_offsets);
+    try std.testing.expectEqualDeep(expected_grammar.rules_rhs.index_to_row_map, actual_grammar.rules_rhs.index_to_row_map);
     try std.testing.expectEqualDeep(expected_grammar.variables, actual_grammar.variables);
     try std.testing.expectEqualDeep(expected_grammar.terminals, actual_grammar.terminals);
 }
 
 test "Grammar.initFromTuples [grammar2.2]" {
-    const V_S = 0;
-    const V_WFF1 = 1;
-    const V_WFF2 = 2;
-    const V_WFF3 = 3;
-    const V_WFF4 = 4;
-    const V_PROP = 5;
-    const T_BICOND = 0;
-    const T_COND = 1;
-    const T_OR = 2;
-    const T_AND = 3;
-    const T_NOT = 4;
-    const T_LPAREN = 5;
-    const T_RPAREN = 6;
-    const T_PROPTOK = 7;
-
-    // R0:  S -> wff1
-    // R1:  wff1 -> wff2
-    // R2:  wff1 -> wff1 <=> wff2
-    // R3:  wff2 -> wff3
-    // R4:  wff2 -> wff2 => wff3
-    // R5:  wff3 -> wff4
-    // R6:  wff3 -> wff3 v wff4
-    // R7:  wff3 -> wff3 ^ wff4
-    // R8:  wff4 -> prop
-    // R9:  wff4 -> ~ wff4
-    // R10: prop -> (wff1)
-    // R11: prop -> PROPTOK
+    // R0:     S ->  (0) wff1  (1)
+    // R1:  wff1 ->  (2) wff2  (3)
+    // R2:  wff1 ->  (4) wff1  (5) <=> (6) wff2 (7)
+    // R3:  wff2 ->  (8) wff3  (9)
+    // R4:  wff2 -> (10) wff2 (11) => (12) wff3 (13)
+    // R5:  wff3 -> (14) wff4 (15)
+    // R6:  wff3 -> (16) wff3 (17) v (18) wff4 (19)
+    // R7:  wff3 -> (20) wff3 (21) ^ (22) wff4 (23)
+    // R8:  wff4 -> (24) prop (25)
+    // R9:  wff4 -> (26) ~    (27) wff4 (28)
+    // R10: prop -> (29) ( (30) wff1 (31) )  (32)
+    // R11: prop -> (33) PROPTOK (34)
 
     const TestVariable = test_common.TestVariable;
     const TestTerminal = test_common.TestWffTerminal;
@@ -827,49 +903,110 @@ test "Grammar.initFromTuples [grammar2.2]" {
 
     const actual_grammar = comptime G.initFromTuples(
         .{
-            .{ V("S"), .{V("wff1")} },
+            .{ V("S"), .{ V("wff1") } },
 
-            .{ V("wff1"), .{V("wff2")} },
+            .{ V("wff1"), .{ V("wff2") } },
             .{ V("wff1"), .{ V("wff1"), TestTerminal.Bicond, V("wff2") } },
 
-            .{ V("wff2"), .{V("wff3")} },
+            .{ V("wff2"), .{ V("wff3") } },
             .{ V("wff2"), .{ V("wff2"), TestTerminal.Cond, V("wff3") } },
 
-            .{ V("wff3"), .{V("wff4")} },
+            .{ V("wff3"), .{ V("wff4") } },
             .{ V("wff3"), .{ V("wff3"), TestTerminal.Or, V("wff4") } },
             .{ V("wff3"), .{ V("wff3"), TestTerminal.And, V("wff4") } },
 
-            .{ V("wff4"), .{V("prop")} },
+            .{ V("wff4"), .{ V("prop") } },
             .{ V("wff4"), .{ TestTerminal.Not, V("wff4") } },
 
             .{ V("prop"), .{ TestTerminal.LParen, V("wff1"), TestTerminal.RParen } },
-            .{ V("prop"), .{TestTerminal.Proposition} },
+            .{ V("prop"), .{ TestTerminal.Proposition } },
         },
         V("S"),
         TestTerminal.End,
     );
 
-    const r0 = Production{ .lhs = V_S, .rhs = &[_]SymbolId{.{ .variable_id = V_WFF1 }} };
-    const r1 = Production{ .lhs = V_WFF1, .rhs = &[_]SymbolId{.{ .variable_id = V_WFF2 }} };
-    const r2 = Production{ .lhs = V_WFF1, .rhs = &[_]SymbolId{ .{ .variable_id = V_WFF1 }, .{ .terminal_id = T_BICOND }, .{ .variable_id = V_WFF2 } } };
-    const r3 = Production{ .lhs = V_WFF2, .rhs = &[_]SymbolId{.{ .variable_id = V_WFF3 }} };
-    const r4 = Production{ .lhs = V_WFF2, .rhs = &[_]SymbolId{ .{ .variable_id = V_WFF2 }, .{ .terminal_id = T_COND }, .{ .variable_id = V_WFF3 } } };
-    const r5 = Production{ .lhs = V_WFF3, .rhs = &[_]SymbolId{.{ .variable_id = V_WFF4 }} };
-    const r6 = Production{ .lhs = V_WFF3, .rhs = &[_]SymbolId{ .{ .variable_id = V_WFF3 }, .{ .terminal_id = T_OR }, .{ .variable_id = V_WFF4 } } };
-    const r7 = Production{ .lhs = V_WFF3, .rhs = &[_]SymbolId{ .{ .variable_id = V_WFF3 }, .{ .terminal_id = T_AND }, .{ .variable_id = V_WFF4 } } };
-    const r8 = Production{ .lhs = V_WFF4, .rhs = &[_]SymbolId{.{ .variable_id = V_PROP }} };
-    const r9 = Production{ .lhs = V_WFF4, .rhs = &[_]SymbolId{ .{ .terminal_id = T_NOT }, .{ .variable_id = V_WFF4 } } };
-    const r10 = Production{ .lhs = V_PROP, .rhs = &[_]SymbolId{ .{ .terminal_id = T_LPAREN }, .{ .variable_id = V_WFF1 }, .{ .terminal_id = T_RPAREN } } };
-    const r11 = Production{ .lhs = V_PROP, .rhs = &[_]SymbolId{.{ .terminal_id = T_PROPTOK }} };
+    const V_S = SymbolId{ .variable_id = 0 };
+    const V_WFF1 = SymbolId{ .variable_id = 1 };
+    const V_WFF2 = SymbolId{ .variable_id = 2 };
+    const V_WFF3 = SymbolId{ .variable_id = 3 };
+    const V_WFF4 = SymbolId{ .variable_id = 4 };
+    const V_PROP = SymbolId{ .variable_id = 5 };
+    const SENTINEL = G.SENTINEL;
+    const T_BICOND = SymbolId{ .terminal_id = 0 };
+    const T_COND = SymbolId{ .terminal_id = 1 };
+    const T_OR = SymbolId{ .terminal_id = 2 };
+    const T_AND = SymbolId{ .terminal_id = 3 };
+    const T_NOT = SymbolId{ .terminal_id = 4 };
+    const T_LPAREN = SymbolId{ .terminal_id = 5 };
+    const T_RPAREN = SymbolId{ .terminal_id = 6 };
+    const T_PROPTOK = SymbolId{ .terminal_id = 7 };
+
+    const rules_lhs = [_]SymbolId.VariableId{
+        V_S.variable_id,
+        V_WFF1.variable_id,
+        V_WFF1.variable_id,
+        V_WFF2.variable_id,
+        V_WFF2.variable_id,
+        V_WFF3.variable_id,
+        V_WFF3.variable_id,
+        V_WFF3.variable_id,
+        V_WFF4.variable_id,
+        V_WFF4.variable_id,
+        V_PROP.variable_id,
+        V_PROP.variable_id,
+    };
+
+    const rules_rhs = [_]SymbolId{
+        V_WFF1, SENTINEL,
+
+        V_WFF2, SENTINEL,
+        V_WFF1, T_BICOND, V_WFF2, SENTINEL,
+
+        V_WFF3, SENTINEL,
+        V_WFF2, T_COND, V_WFF3, SENTINEL,
+
+        V_WFF4, SENTINEL,
+        V_WFF3, T_OR, V_WFF4, SENTINEL,
+        V_WFF3, T_AND, V_WFF4, SENTINEL,
+
+        V_PROP, SENTINEL,
+        T_NOT, V_WFF4, SENTINEL,
+        T_LPAREN, V_WFF1, T_RPAREN, SENTINEL,
+        T_PROPTOK, SENTINEL,
+    };
+
+    const offsets = [_]usize{ 0, 2, 4, 8, 10, 14, 16, 20, 24, 26, 29, 33, 35 };
+
+    const index_to_row_map = [_]usize{
+        0, 0,
+        1, 1,
+        2, 2, 2, 2,
+        3, 3,
+        4, 4, 4, 4,
+        5, 5,
+        6, 6, 6, 6,
+        7, 7, 7, 7,
+        8, 8,
+        9, 9, 9,
+        10, 10, 10, 10,
+        11, 11,
+    };
 
     const expected_grammar = G{
-        .rules = &[_]Production{ r0, r1, r2, r3, r4, r5, r6, r7, r8, r9, r10, r11 },
-        .state_count = 35,
+        .rules_lhs = &rules_lhs,
+        .rules_rhs = utils.RaggedArray(SymbolId, true){
+            .data = &rules_rhs,
+            .row_offsets = &offsets,
+            .index_to_row_map = &index_to_row_map,
+        },
         .variables = &[_]TestVariable{ V("S"), V("wff1"), V("wff2"), V("wff3"), V("wff4"), V("prop") },
         .terminals = &[_]TestTerminal{ .Bicond, .Cond, .Or, .And, .Not, .LParen, .RParen, .Proposition, .End },
     };
 
-    try std.testing.expectEqualDeep(expected_grammar.rules, actual_grammar.rules);
+    try std.testing.expectEqualDeep(expected_grammar.rules_lhs, actual_grammar.rules_lhs);
+    try std.testing.expectEqualDeep(expected_grammar.rules_rhs.data, actual_grammar.rules_rhs.data);
+    try std.testing.expectEqualDeep(expected_grammar.rules_rhs.row_offsets, actual_grammar.rules_rhs.row_offsets);
+    try std.testing.expectEqualDeep(expected_grammar.rules_rhs.index_to_row_map, actual_grammar.rules_rhs.index_to_row_map);
     try std.testing.expectEqualDeep(expected_grammar.variables, actual_grammar.variables);
     try std.testing.expectEqualDeep(expected_grammar.terminals, actual_grammar.terminals);
 }
@@ -907,13 +1044,13 @@ test "epsilonClosures [custom5]" {
     // A ->  (6) B  (7) b  (8)
     // B ->  (9) A (10) c (11)
     // B -> (12) q
-    const expected_closures = [_]G.NfaState {
+    const expected_closures = [_]G.NfaView.State{
         0, 2, 6, 9, 12, // S
         2, 6, 9, 12,    // A
         2, 6, 9, 12,    // B
     };
 
-    try std.testing.expectEqualSlices(G.NfaState, &expected_closures, closures.data);
+    try std.testing.expectEqualSlices(G.NfaView.State, &expected_closures, closures.data);
 }
 
 test "firsts_and_follows [grammar1.0]" {
@@ -949,12 +1086,12 @@ test "firsts_and_follows [grammar1.0]" {
 
     const follow_set = try grammar.getFollowSet(
         allocator,
-        utils.Slice2d([]const bool).init(first_set, grammar.getSymbolCount())
+        utils.Slice2d([]const bool).init(first_set, grammar.getSymbolCount()),
     );
     defer allocator.free(follow_set);
 
     const follow_set_comptime = comptime grammar.getFollowSetComptime(
-        utils.Slice2d([]const bool).init(first_set_comptime, grammar.getSymbolCount())
+        utils.Slice2d([]const bool).init(first_set_comptime, grammar.getSymbolCount()),
     );
 
     const expected_follow = [_]bool{
@@ -1031,12 +1168,12 @@ test "firsts_and_follows [grammar2.2]" {
 
     const follow_set = try grammar.getFollowSet(
         allocator,
-        utils.Slice2d([]const bool).init(first_set, grammar.getSymbolCount())
+        utils.Slice2d([]const bool).init(first_set, grammar.getSymbolCount()),
     );
     defer allocator.free(follow_set);
 
     const follow_set_comptime = comptime grammar.getFollowSetComptime(
-        utils.Slice2d([]const bool).init(first_set_comptime, grammar.getSymbolCount())
+        utils.Slice2d([]const bool).init(first_set_comptime, grammar.getSymbolCount()),
     );
 
     const expected_follow = [_]bool{
@@ -1058,7 +1195,7 @@ fn followTableFromTuples(
     grammar: Grammar(Variable, Terminal),
 ) [grammar.getVariableCount() * grammar.getTerminalCount()]bool {
     comptime {
-        var follow_set = [_]bool {false} ** (grammar.getVariableCount() * grammar.getTerminalCount());
+        var follow_set = [_]bool{false} ** (grammar.getVariableCount() * grammar.getTerminalCount());
         var follow_set_2d_view = utils.Slice2d([]bool).init(&follow_set, grammar.getTerminalCount());
 
         for (tuples) |tuple| {
@@ -1087,7 +1224,7 @@ fn firstTableFromTuples(
     grammar: Grammar(Variable, Terminal),
 ) [grammar.getVariableCount() * grammar.getSymbolCount()]bool {
     comptime {
-        var first_set = [_]bool {false} ** (grammar.getVariableCount() * grammar.getSymbolCount());
+        var first_set = [_]bool{false} ** (grammar.getVariableCount() * grammar.getSymbolCount());
         var first_set_2d_view = utils.Slice2d([]bool).init(&first_set, grammar.getSymbolCount());
 
         for (tuples) |tuple| {
@@ -1150,7 +1287,6 @@ test "first_and_follows [custom1]" {
         TestVariable,
         TestTerminal,
         grammar,
-
     );
     // TODO: how to make comptime tests fail nicer (avoid compile error, or
     //       make more descriptive)
@@ -1203,7 +1339,7 @@ test "first_and_follows [custom2]" {
         },
         TestVariable,
         TestTerminal,
-        grammar
+        grammar,
     );
 
     try std.testing.expectEqualSlices(bool, &expected_first_set, first_set);

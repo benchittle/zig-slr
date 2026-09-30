@@ -40,23 +40,23 @@ const ProductionInstance = struct {
     }
 
     fn printDebug(self: Self) !void {
-            std.debug.print("({d})", .{self.production.lhs.variable_id});
-            std.debug.print(" ->", .{});
-            for (self.production.rhs[0..self.cursor]) |sym| {
-                switch (sym) {
-                    .variable_id => |id| std.debug.print(" ({d})", .{id}),
-                    .terminal_id => |id| std.debug.print(" {d}", .{id}),
-                }
+        std.debug.print("({d})", .{self.production.lhs.variable_id});
+        std.debug.print(" ->", .{});
+        for (self.production.rhs[0..self.cursor]) |sym| {
+            switch (sym) {
+                .variable_id => |id| std.debug.print(" ({d})", .{id}),
+                .terminal_id => |id| std.debug.print(" {d}", .{id}),
             }
-            std.debug.print(" *", .{});
-            for (self.production.rhs[self.cursor..]) |sym| {
-                switch (sym) {
-                    .variable_id => |id| std.debug.print(" ({d})", .{id}),
-                    .terminal_id => |id| std.debug.print(" {d}", .{id}),
-                }
-            }
-            std.debug.print("\n", .{});
         }
+        std.debug.print(" *", .{});
+        for (self.production.rhs[self.cursor..]) |sym| {
+            switch (sym) {
+                .variable_id => |id| std.debug.print(" ({d})", .{id}),
+                .terminal_id => |id| std.debug.print(" {d}", .{id}),
+            }
+        }
+        std.debug.print("\n", .{});
+    }
 };
 
 pub fn ParseTable(comptime Variable: type, comptime Terminal: type) type {
@@ -77,7 +77,7 @@ pub fn ParseTable(comptime Variable: type, comptime Terminal: type) type {
         action_table: utils.Slice2d([]Action),
 
         pub fn init(allocator: std.mem.Allocator, grammar: GrammarType) !Self {
-            const action_table, const goto_table = try generateTables(allocator, grammar);
+            const action_table, const goto_table = try generateTables3(allocator, grammar);
             return Self{
                 .grammar = grammar,
                 .goto_table = goto_table,
@@ -194,7 +194,8 @@ pub fn ParseTable(comptime Variable: type, comptime Terminal: type) type {
                             // expand it by pushing any productions from it onto
                             // the stack.
                             if (variable_branches[id].items.len == 0) {
-                                for (grammar.rules) |rule| {
+                                for (0..grammar.ruleCount()) |rule_id| {
+                                    const rule = grammar.getRule(rule_id);
                                     if (sym.eqlVariable(rule.lhs)) {
                                         try stack.append(allocator, ProductionInstance.fromProduction(rule));
                                     }
@@ -230,35 +231,8 @@ pub fn ParseTable(comptime Variable: type, comptime Terminal: type) type {
 
         fn generateTables3(
             allocator: std.mem.Allocator,
-            grammar: GrammarType
-        ) !struct {utils.Slice2d([]Action), utils.Slice2d([]Action)} {
-            // Generate state -> rule map
-            var state_to_rule_map = try allocator.alloc(usize, grammar.state_count);
-            defer allocator.free(state_to_rule_map);
-            {
-                var count: usize = 0;
-                for (grammar.rules, 0..) |rule, rule_num| {
-                    for (0..rule.rhs.len + 1) |_| {
-                        state_to_rule_map[count] = rule_num;
-                        count += 1;
-                    }
-                }
-            }
-
-            // Generate rule -> first state map
-            var rule_to_first_state_map = try allocator.alloc(GrammarType.NfaState, grammar.rules.len);
-            defer allocator.free(rule_to_first_state_map);
-            rule_to_first_state_map[0] = 0;
-            {
-                var previous_rule: usize = 0;
-                for (state_to_rule_map, 0..) |rule, state| {
-                    if (previous_rule != rule) {
-                        rule_to_first_state_map[rule] = state;
-                        previous_rule = rule;
-                    }
-                }
-            }
-
+            grammar: GrammarType,
+        ) !struct { utils.Slice2d([]Action), utils.Slice2d([]Action) } {
             // Generate grammar variable to epsilon closure map
             var closures = try grammar.computeEpsilonClosures(allocator);
             defer closures.deinit(allocator);
@@ -279,14 +253,14 @@ pub fn ParseTable(comptime Variable: type, comptime Terminal: type) type {
             // TODO: do i actually need to store values, or can i just use the
             // index of they keys?
             const ArrayHashMapType = std.array_hash_map.Custom(
-                []GrammarType.NfaState,
+                []GrammarType.NfaView.State,
                 StateIdx,
                 struct {
-                    pub fn hash(_: @This(), key: []GrammarType.NfaState) u32 {
+                    pub fn hash(_: @This(), key: []GrammarType.NfaView.State) u32 {
                         return @truncate(std.hash.Wyhash.hash(0, std.mem.sliceAsBytes(key)));
                     }
-                    pub fn eql(_: @This(), a: []GrammarType.NfaState, b: []GrammarType.NfaState, _: usize) bool {
-                        return std.mem.eql(GrammarType.NfaState, a, b);
+                    pub fn eql(_: @This(), a: []GrammarType.NfaView.State, b: []GrammarType.NfaView.State, _: usize) bool {
+                        return std.mem.eql(GrammarType.NfaView.State, a, b);
                     }
                 },
                 // TODO: better understand what this does
@@ -303,15 +277,18 @@ pub fn ParseTable(comptime Variable: type, comptime Terminal: type) type {
             // First DFA state is the epsilon closure of the first e-NFA state
             try table_state_sets.put(
                 allocator,
-                try allocator.dupe(GrammarType.NfaState, &[_]GrammarType.NfaState {grammar.getStartSymbolId().variable_id}),
+                try allocator.dupe(
+                    GrammarType.NfaView.State,
+                    &[_]GrammarType.NfaView.State{grammar.getStartSymbolId().variable_id},
+                ),
                 0,
             );
 
             // Now populate the table: add new rows until all state sets
             // accounted for
-            var action_row_state_sets: []std.ArrayList(GrammarType.NfaState) = try allocator.alloc(
-                std.ArrayList(GrammarType.NfaState),
-                grammar.getTerminalCount()
+            var action_row_state_sets: []std.ArrayList(GrammarType.NfaView.State) = try allocator.alloc(
+                std.ArrayList(GrammarType.NfaView.State),
+                grammar.getTerminalCount(),
             );
             for (0..action_row_state_sets.len) |i| {
                 action_row_state_sets[i] = .empty;
@@ -320,8 +297,8 @@ pub fn ParseTable(comptime Variable: type, comptime Terminal: type) type {
                 for (action_row_state_sets) |*set| set.deinit(allocator);
                 allocator.free(action_row_state_sets);
             }
-            var goto_row_state_sets: []std.ArrayList(GrammarType.NfaState) = try allocator.alloc(
-                std.ArrayList(GrammarType.NfaState),
+            var goto_row_state_sets: []std.ArrayList(GrammarType.NfaView.State) = try allocator.alloc(
+                std.ArrayList(GrammarType.NfaView.State),
                 grammar.getVariableCount(),
             );
             for (0..goto_row_state_sets.len) |i| {
@@ -331,9 +308,10 @@ pub fn ParseTable(comptime Variable: type, comptime Terminal: type) type {
                 for (goto_row_state_sets) |*set| set.deinit(allocator);
                 allocator.free(goto_row_state_sets);
             }
+            const nfa = grammar.nfa();
             var state: StateIdx = 0;
             while (state < table_state_sets.count()) : (state += 1) {
-                const nfa_kernels = table_state_sets.entries.get(state).key; // table_state_sets.items[state];
+                const nfa_kernels = table_state_sets.entries.get(state).key;
 
                 for (action_row_state_sets) |*set| {
                     set.items.len = 0;
@@ -356,75 +334,56 @@ pub fn ParseTable(comptime Variable: type, comptime Terminal: type) type {
                 @memset(goto_row, .invalid);
 
                 // Populate NFA state sets in the row
-                // TODO: need to sort sets???
                 for (nfa_kernels) |kernel_nfa_state| {
-                    // TODO here and other places: a "getSymbolFromNfaState"
-                    // function would be great
-
-                    // std.debug.print("state_to_rule_map: {any}\n", .{state_to_rule_map});
-                    // std.debug.print("rule_to_first_state_map: {any}\n", .{rule_to_first_state_map});
-
                     // First deal with symbol being read in the kernel state
-                    const kernel_symbol = ret: {
-                        const rule_id = state_to_rule_map[kernel_nfa_state];
-                        const rule_first_state = rule_to_first_state_map[rule_id];
-                        const rule = grammar.rules[rule_id];
-                        const last_nfa_state_in_rule = rule_first_state + rule.rhs.len;
-                        if (kernel_nfa_state == last_nfa_state_in_rule) {
-                            continue;
-                        }
-                        break :ret rule.rhs[kernel_nfa_state - rule_first_state];
-                    };
-                    switch(kernel_symbol) {
+                    const kernel_symbol = nfa.symbolIdFromState(kernel_nfa_state) orelse continue;
+                    const kernel_symbol_v_id = ret: switch (kernel_symbol) {
                         .terminal_id => |id| {
                             try action_row_state_sets[id].append(allocator, kernel_nfa_state + 1);
                             continue;
-                         },
-                        .variable_id => |id| try goto_row_state_sets[id].append(allocator, kernel_nfa_state + 1),
-                    }
-
-                    // We only get here if kernel_symbol is a variable
-                    const kernel_closure = ret: {
-                        const rule_id = state_to_rule_map[kernel_nfa_state];
-                        const rule_first_state = rule_to_first_state_map[rule_id];
-                        const rule = grammar.rules[rule_id];
-
-                        // std.debug.print("rule: {any}\nrule_first_state: {any}\n", .{rule, rule_first_state});
-                        const symbol = rule.rhs[kernel_nfa_state - rule_first_state];
-                        // std.debug.print("{any}\n", .{symbol});
-                        break :ret closures.row(symbol.variable_id);
+                        },
+                        .variable_id => |id| {
+                            try goto_row_state_sets[id].append(allocator, kernel_nfa_state + 1);
+                            break :ret id;
+                        },
                     };
 
-                    // std.debug.print("{any}\n", .{kernel_closure});
-
+                    // We only get here if kernel_symbol is a variable
+                    const kernel_closure = closures.row(kernel_symbol_v_id);
                     for (kernel_closure) |nfa_state| {
-                        const rule_id = state_to_rule_map[nfa_state];
-                        const rule = grammar.rules[rule_id];
-                        const rule_first_state = rule_to_first_state_map[rule_id];
-
-                        const last_nfa_state_in_rule = rule_first_state + rule.rhs.len;
-                        std.debug.assert(nfa_state != last_nfa_state_in_rule);
-
-                        const reading_symbol = rule.rhs[nfa_state - rule_first_state];
+                        const reading_symbol = nfa.symbolIdFromState(nfa_state).?;
                         switch (reading_symbol) {
                             .terminal_id => |id| {
-                                if (std.mem.findScalar(GrammarType.NfaState, action_row_state_sets[id].items, nfa_state + 1) == null) {
+                                const found =std.mem.findScalar(
+                                    GrammarType.NfaView.State,
+                                    action_row_state_sets[id].items,
+                                    nfa_state + 1,
+                                );
+                                if (found == null) {
                                     try action_row_state_sets[id].append(allocator, nfa_state + 1);
                                 }
                             },
                             .variable_id => |id| {
-                                if (std.mem.findScalar(GrammarType.NfaState, goto_row_state_sets[id].items, nfa_state + 1) == null) {
-                                    try goto_row_state_sets[id].append(allocator,nfa_state + 1);
+                                const found = std.mem.findScalar(
+                                    GrammarType.NfaView.State,
+                                    goto_row_state_sets[id].items,
+                                    nfa_state + 1,
+                                );
+                                if (found == null) {
+                                    try goto_row_state_sets[id].append(allocator, nfa_state + 1);
                                 }
-                            }
+                            },
                         }
                     }
                 }
 
-                // PROBLEM FOUND: sets are getting duplicate elements above --
-                // need to check for duplicate before inserting
                 for (action_row_state_sets) |*set| {
-                    std.mem.sortUnstable(GrammarType.NfaState, set.items, {}, std.sort.asc(GrammarType.NfaState));
+                    std.mem.sortUnstable(
+                        GrammarType.NfaView.State,
+                        set.items,
+                        {},
+                        std.sort.asc(GrammarType.NfaView.State),
+                    );
                 }
 
                 // Look at NFA state sets in the current row: skip existing
@@ -441,15 +400,20 @@ pub fn ParseTable(comptime Variable: type, comptime Terminal: type) type {
                         const new_state_id = table_state_sets.count();
                         try table_state_sets.put(
                             allocator,
-                            try allocator.dupe(GrammarType.NfaState, set.items),
-                            new_state_id
+                            try allocator.dupe(GrammarType.NfaView.State,set.items),
+                            new_state_id,
                         );
                         action_row[t_id] = Action{ .state = new_state_id };
                     }
                 }
 
                 for (goto_row_state_sets) |*set| {
-                    std.mem.sortUnstable(GrammarType.NfaState, set.items, {}, std.sort.asc(GrammarType.NfaState));
+                    std.mem.sortUnstable(
+                        GrammarType.NfaView.State,
+                        set.items,
+                        {},
+                        std.sort.asc(GrammarType.NfaView.State),
+                    );
                 }
 
                 for (goto_row_state_sets, 0..) |set, v_id| {
@@ -463,8 +427,8 @@ pub fn ParseTable(comptime Variable: type, comptime Terminal: type) type {
                         const new_state_id = table_state_sets.count();
                         try table_state_sets.put(
                             allocator,
-                            try allocator.dupe(GrammarType.NfaState, set.items),
-                            new_state_id
+                            try allocator.dupe(GrammarType.NfaView.State, set.items),
+                            new_state_id,
                         );
                         goto_row[v_id] = Action{ .state = new_state_id };
                     }
@@ -490,13 +454,13 @@ pub fn ParseTable(comptime Variable: type, comptime Terminal: type) type {
             // populate reductions as we hit end states
             for (table_state_sets.entries.items(.key), 0..) |set, state_id| {
                 for (set) |nfa_state| {
-                    const rule_id = state_to_rule_map[nfa_state];
-                    const last_nfa_state_in_rule = rule_to_first_state_map[rule_id] + grammar.rules[rule_id].rhs.len;
-                    if (nfa_state != last_nfa_state_in_rule) {
+                    // Continue if this isn't the last state in a rule.
+                    if (nfa.symbolIdFromState(nfa_state) != null) {
                         continue;
                     }
 
-                    const rule = grammar.rules[rule_id];
+                    const rule_id = nfa.ruleIdFromState(nfa_state);
+                    const rule = grammar.getRule(rule_id);
                     for (follow_set.row(rule.lhs), 0..) |is_in_follow_set, t_id| {
                         if (!is_in_follow_set) {
                             continue;
@@ -511,14 +475,6 @@ pub fn ParseTable(comptime Variable: type, comptime Terminal: type) type {
                     }
                 }
             }
-
-
-            // TODO: can probably remove ACC state, parser just assumes end of start rule and no
-            //       further input = ACC
-            // if (action_table.items[0][grammar.getEndSymbolId().terminal_id] != .invalid) {
-            //     return TableGeneratorError.acceptError;
-            // }
-            // action_table.items[0][grammar.getEndSymbolId().terminal_id] = .accept;
 
             var action_table_final = utils.Slice2d([]Action).init(
                 try allocator.alloc(Action, action_table.items.len * grammar.getTerminalCount()),
@@ -538,13 +494,13 @@ pub fn ParseTable(comptime Variable: type, comptime Terminal: type) type {
                 @memcpy(goto_table_final.row(i), row);
             }
 
-            return .{action_table_final, goto_table_final};
+            return .{ action_table_final, goto_table_final };
         }
 
         fn generateTables(
             allocator: std.mem.Allocator,
-            grammar: GrammarType
-        ) !struct {utils.Slice2d([]Action), utils.Slice2d([]Action)} {
+            grammar: GrammarType,
+        ) !struct { utils.Slice2d([]Action), utils.Slice2d([]Action) } {
             var goto_table = std.ArrayList([]Action).empty;
             defer goto_table.deinit(allocator);
             errdefer for (goto_table.items) |row| {
@@ -566,7 +522,7 @@ pub fn ParseTable(comptime Variable: type, comptime Terminal: type) type {
             try goto_table.append(allocator, try allocator.alloc(Action, grammar.getVariableCount()));
             try action_table.append(allocator, try allocator.alloc(Action, grammar.getTerminalCount()));
             try primary_productions_table.append(allocator, try allocator.alloc(ProductionInstance, 1));
-            primary_productions_table.items[0][0] = ProductionInstance.fromProduction(grammar.rules[grammar.getStartRuleId()]);
+            primary_productions_table.items[0][0] = ProductionInstance.fromProduction(grammar.getRule(grammar.getStartRuleId()));
 
             var state: usize = 0;
             while (state < goto_table.items.len) : (state += 1) {
@@ -692,7 +648,7 @@ pub fn ParseTable(comptime Variable: type, comptime Terminal: type) type {
                 allocator.free(action_table.items[i]);
             }
 
-            return .{action_const_view, goto_const_view};
+            return .{ action_const_view, goto_const_view };
         }
     };
 }
@@ -715,29 +671,29 @@ test "ParseTable.expandProductions [grammar1.0]" {
 
     const P = ParseTable(TestVariable, TestTerminal);
 
-    const expected_variable_branches = &[_][]const ProductionInstance {
-        &[_]ProductionInstance {},
-        &[_]ProductionInstance { .{.production = grammar.rules[0], .cursor = 1} },
+    const expected_variable_branches = &[_][]const ProductionInstance{
+        &[_]ProductionInstance{},
+        &[_]ProductionInstance{.{ .production = grammar.getRule(0), .cursor = 1 }},
     };
 
-    const expected_terminal_branches = &[_][]const ProductionInstance {
-        &[_]ProductionInstance { .{.production = grammar.rules[1], .cursor = 1} },
-        &[_]ProductionInstance { .{.production = grammar.rules[2], .cursor = 1} },
-        &[_]ProductionInstance {
-            .{.production = grammar.rules[6], .cursor = 1},
-            .{.production = grammar.rules[5], .cursor = 1},
-            .{.production = grammar.rules[4], .cursor = 1},
-            .{.production = grammar.rules[3], .cursor = 1},
+    const expected_terminal_branches = &[_][]const ProductionInstance{
+        &[_]ProductionInstance{.{ .production = grammar.getRule(1), .cursor = 1 }},
+        &[_]ProductionInstance{.{ .production = grammar.getRule(2), .cursor = 1 }},
+        &[_]ProductionInstance{
+            .{ .production = grammar.getRule(6), .cursor = 1 },
+            .{ .production = grammar.getRule(5), .cursor = 1 },
+            .{ .production = grammar.getRule(4), .cursor = 1 },
+            .{ .production = grammar.getRule(3), .cursor = 1 },
         },
-        &[_]ProductionInstance {},
-        &[_]ProductionInstance {},
-        &[_]ProductionInstance {},
-        &[_]ProductionInstance {},
-        &[_]ProductionInstance {},
-        &[_]ProductionInstance {},
+        &[_]ProductionInstance{},
+        &[_]ProductionInstance{},
+        &[_]ProductionInstance{},
+        &[_]ProductionInstance{},
+        &[_]ProductionInstance{},
+        &[_]ProductionInstance{},
     };
 
-    const start_productions = [_]ProductionInstance{ProductionInstance.fromProduction(grammar.rules[0])};
+    const start_productions = [_]ProductionInstance{ProductionInstance.fromProduction(grammar.getRule(0))};
     const variable_branches, const terminal_branches = try P.expandProductions(std.testing.allocator, grammar, &start_productions);
     defer {
         for (0..variable_branches.len) |i| {
@@ -905,8 +861,8 @@ test "Create parse table [grammar2.0]" {
 
     table.printDebugTable();
 
-//     try std.testing.expectEqualDeep(table.action_table, table_comptime.action_table);
-//     try std.testing.expectEqualDeep(table.goto_table, table_comptime.goto_table);
+    //     try std.testing.expectEqualDeep(table.action_table, table_comptime.action_table);
+    //     try std.testing.expectEqualDeep(table.goto_table, table_comptime.goto_table);
 }
 
 test "Create parse table [test-grammar-1]" {
@@ -945,8 +901,8 @@ test "Create parse table [test-grammar-1]" {
 
     table.printDebugTable();
 
-//     try std.testing.expectEqualDeep(table.action_table, table_comptime.action_table);
-//     try std.testing.expectEqualDeep(table.goto_table, table_comptime.goto_table);
+    //     try std.testing.expectEqualDeep(table.action_table, table_comptime.action_table);
+    //     try std.testing.expectEqualDeep(table.goto_table, table_comptime.goto_table);
 }
 
 // test "generateTables2" {
