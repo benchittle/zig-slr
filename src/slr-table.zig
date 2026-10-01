@@ -254,7 +254,7 @@ pub fn ParseTable(comptime Variable: type, comptime Terminal: type) type {
             // index of they keys?
             const ArrayHashMapType = std.array_hash_map.Custom(
                 []GrammarType.NfaView.State,
-                StateIdx,
+                void,
                 struct {
                     pub fn hash(_: @This(), key: []GrammarType.NfaView.State) u32 {
                         return @truncate(std.hash.Wyhash.hash(0, std.mem.sliceAsBytes(key)));
@@ -281,7 +281,7 @@ pub fn ParseTable(comptime Variable: type, comptime Terminal: type) type {
                     GrammarType.NfaView.State,
                     &[_]GrammarType.NfaView.State{grammar.getStartSymbolId().variable_id},
                 ),
-                0,
+                {},
             );
 
             // Now populate the table: add new rows until all state sets
@@ -394,14 +394,14 @@ pub fn ParseTable(comptime Variable: type, comptime Terminal: type) type {
                         continue;
                     }
                     std.debug.assert(action_row[t_id] == .invalid);
-                    if (table_state_sets.get(set.items)) |state_id| {
+                    if (table_state_sets.getIndex(set.items)) |state_id| {
                         action_row[t_id] = Action{ .state = state_id };
                     } else {
                         const new_state_id = table_state_sets.count();
                         try table_state_sets.put(
                             allocator,
                             try allocator.dupe(GrammarType.NfaView.State,set.items),
-                            new_state_id,
+                            {},
                         );
                         action_row[t_id] = Action{ .state = new_state_id };
                     }
@@ -421,14 +421,14 @@ pub fn ParseTable(comptime Variable: type, comptime Terminal: type) type {
                         continue;
                     }
                     std.debug.assert(goto_row[v_id] == .invalid);
-                    if (table_state_sets.get(set.items)) |state_id| {
+                    if (table_state_sets.getIndex(set.items)) |state_id| {
                         goto_row[v_id] = Action{ .state = state_id };
                     } else {
                         const new_state_id = table_state_sets.count();
                         try table_state_sets.put(
                             allocator,
                             try allocator.dupe(GrammarType.NfaView.State, set.items),
-                            new_state_id,
+                            {},
                         );
                         goto_row[v_id] = Action{ .state = new_state_id };
                     }
